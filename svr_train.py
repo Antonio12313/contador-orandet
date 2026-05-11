@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 # CONFIGURAÇÃO
 # ─────────────────────────────────────────────
-DATASET_DIR = "./dataset_preparado_v6"
+DATASET_DIR = "dataset_preparado_v6_2"
 OUTPUT_DIR  = "./modelos_svr"
 
 # Arquivos gerados pelo script de extração ajustado ao estilo Maldonado

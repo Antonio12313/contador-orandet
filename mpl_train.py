@@ -16,7 +16,7 @@ from sklearn.metrics import (
     make_scorer,
 )
 
-DATASET_DIR = "./dataset_preparado_v6"
+DATASET_DIR = "dataset_preparado_v6_2"
 TRAIN_CSV   = f"{DATASET_DIR}/orandet_v6_train.csv"
 TEST_CSV    = f"{DATASET_DIR}/orandet_v6_test.csv"
 OUTPUT_DIR  = "./resultados_mlp"
