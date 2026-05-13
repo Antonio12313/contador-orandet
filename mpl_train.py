@@ -11,9 +11,9 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import GridSearchCV, KFold
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, make_scorer
 
-DATASET_DIR = "dataset_preparado_v8"
-TRAIN_CSV   = f"{DATASET_DIR}/orandet_v8_train_norm.csv"
-TEST_CSV    = f"{DATASET_DIR}/orandet_v8_test_norm.csv"
+DATASET_DIR = "dataset_preparado_v9"
+TRAIN_CSV   = f"{DATASET_DIR}/orandet_v9_train_norm.csv"
+TEST_CSV    = f"{DATASET_DIR}/orandet_v9_test_norm.csv"
 OUTPUT_DIR  = "./resultados_mlp_v8"
 
 COLUNAS_META = ["image_id", "file_name", "split", "contagem", "contagem_log", "augmentacao"]
