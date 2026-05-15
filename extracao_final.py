@@ -1,8 +1,4 @@
 """
-extracao_features_v7.py
-═══════════════════════════════════════════════════════════════════════════════
-Dataset: OranDet (Embrapa eContaFruto)
-
 REFERÊNCIAS PRINCIPAIS:
   Maldonado & Barbosa (2016) — Bas-relief + razão brilho vertical, citrus verde
   Kurtulmus et al. (2011) — Gabor isotropy, citrus sobre fundo verde
