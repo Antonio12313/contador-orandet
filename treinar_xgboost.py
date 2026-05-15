@@ -1,35 +1,3 @@
-"""
-treinar_xgboost_v4.py
-═══════════════════════════════════════════════════════════════════════════════
-XGBoost v4 — Combate ao overfitting severo (gap treino/teste = 7x)
-
-DIAGNÓSTICO DOS RESULTADOS ANTERIORES:
-────────────────────────────────────────
-  MAPE travado em 53–55% há 3 versões consecutivas.
-  Gap treino MAE ~0.18 vs teste MAE ~1.24 = overfitting de 7x.
-  G13_multiescala como feature #1 indica dependência circular (máscara→features).
-  G14 (contagem direta) ausente do top 10 = estimadores de contagem gerando ruído.
-  Gap MAPE/MdAPE constante ~18pp = subconjunto de imagens baixas (1-2) sempre errado.
-
-CAUSAS RAIZ:
-────────────
-  1. Augmentação 5x inflando treino: 80% do treino são clones da mesma imagem.
-     XGBoost memoriza padrões específicos de cada cena, não generaliza.
-  2. max_depth=8 com dataset pequeno = memorização garantida.
-  3. G13 executa pipeline completo (máscara+gabor+hog) em 2 escalas extras,
-     criando features circulares que dependem da qualidade da máscara.
-
-SOLUÇÕES v4:
-────────────
-  [TREINO]    Usa APENAS originais (sem augmentação) — elimina memorização
-  [REGULARIZ] max_depth 8→4, min_child_weight 5→15, gamma=0.5 (novo)
-              subsample 0.8→0.7, colsample_bytree 0.7→0.5
-  [VALIDAÇÃO] K-Fold 5 estratificado — avaliação mais robusta com dataset pequeno
-  [OBJETIVO]  count:poisson + eval_metric=mae (combinação validada)
-  [DIAGNÓSTICO] Análise por faixa + diagnóstico de overfitting automático
-═══════════════════════════════════════════════════════════════════════════════
-"""
-
 import os
 import json
 import joblib
