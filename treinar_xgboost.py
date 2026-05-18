@@ -14,12 +14,13 @@ from sklearn.model_selection import KFold
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURAÇÃO
 # ─────────────────────────────────────────────────────────────────────────────
-DATASET_DIR = "./dataset_preparado_v7"
-OUTPUT_DIR = "./resultados_xgboost_v4"
+DATASET_DIR = "./dataset_preparado_v71"
+OUTPUT_DIR = "./resultados_xgboost_v5"
 TARGET_COL = "contagem"
 META_COLS = [
     "image_id", "file_name", "split",
     "contagem", "contagem_log1p", "contagem_sqrt", "augmentacao",
+    "contagem_log"
 ]
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -30,8 +31,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 def carregar_dados():
     print("\n[1/6] Carregando datasets RAW...")
-    df_train_full = pd.read_csv(os.path.join(DATASET_DIR, "orandet_v7_train_raw.csv"))
-    df_test = pd.read_csv(os.path.join(DATASET_DIR, "orandet_v7_test_raw.csv"))
+    df_train_full = pd.read_csv(os.path.join(DATASET_DIR, "orandet_v71_train_raw.csv"))
+    df_test = pd.read_csv(os.path.join(DATASET_DIR, "orandet_v71_test_raw.csv"))
 
     # CORREÇÃO PRINCIPAL: usa apenas originais
     # Com 5x aug, 80% do treino são clones — XGBoost memoriza em vez de aprender

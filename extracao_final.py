@@ -5,6 +5,7 @@ REFERÊNCIAS PRINCIPAIS:
   Zhao & Lee (2016) — SATD, 83.4% acurácia citrus verde
   Okamoto & Lee (2009) — Chromaticidade Cr-Cb para citrus verde
   Hu (2018) — LBP + MSER + Hough hierárquico para citrus verde
+  Frangi et al. (1998) — Hessiana multiscale blob enhancement
 """
 
 import os
@@ -29,7 +30,7 @@ warnings.filterwarnings("ignore")
 # CONFIGURAÇÃO
 # ─────────────────────────────────────────────────────────────────────────────
 DATA_DIR = "/Users/antonioreis/Downloads/dataverse_files"
-OUTPUT_DIR = "./dataset_preparado_v7"
+OUTPUT_DIR = "./dataset_preparado_v71"
 IMG_SIZE = 416
 
 COLUNAS_META = [
@@ -38,8 +39,8 @@ COLUNAS_META = [
 ]
 
 # Thresholds para limpeza de features
-VAR_THRESHOLD = 1e-5  # Remove features com variância < threshold
-CORR_THRESHOLD = 0.97  # Remove features com correlação > threshold (redundância)
+VAR_THRESHOLD = 1e-5
+CORR_THRESHOLD = 0.97
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -59,11 +60,7 @@ def _safe_kurtosis(arr):
 
 
 def _first_order(canal, prefixo):
-    """
-    12 estatísticas de primeira ordem compactas.
-    Reduzido de 18 para 12 — remove redundâncias (range≈max-min, rms≈sqrt(energy), etc.)
-    que contribuíam para correlação alta e prejudicavam SVR/MLP.
-    """
+    """12 estatísticas de primeira ordem compactas."""
     c = np.array(canal, dtype=np.float64).flatten()
     sufixos = [
         "mean", "std", "median", "entropy",
@@ -109,17 +106,11 @@ def _first_order_mascara(canal, mascara, prefixo):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MÁSCARA v7 — Melhorada com thresholds adaptativos mais robustos
-# Baseada na v6.1 mas com critério de curvatura (Hessian) substituindo
-# o critério F (razão de brilho vertical em janelas) que era lento e ruidoso.
+# MAPAS AUXILIARES (compartilhados entre máscara e features)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _gabor_isotropy_map(gray):
-    """
-    Isotropia Gabor: fruta esférica = resposta uniforme em todas orientações.
-    Folha nervurada = resposta direcional.
-    Ref: Kurtulmus et al. (2011).
-    """
+    """Isotropia Gabor: fruta esférica = resposta uniforme em todas orientações."""
     orientacoes = [0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
     respostas = []
     for theta in orientacoes:
@@ -138,7 +129,7 @@ def _gabor_isotropy_map(gray):
 
 
 def _satd_map(gray):
-    """SATD: fruta lisa = baixo, nervura = alto. Ref: Zhao & Lee (2016)."""
+    """SATD: fruta lisa = baixo, nervura = alto."""
     gray_f = gray.astype(np.float32)
     blur5 = cv2.blur(gray_f, (5, 5))
     blur11 = cv2.blur(gray_f, (11, 11))
@@ -152,111 +143,125 @@ def _laplacian_smooth_map(gray):
     return cv2.GaussianBlur(lap_abs, (31, 31), 0)
 
 
-def _hough_seed_map(gray, img_size):
-    """Campo de atração ao redor de círculos detectados por Hough."""
-    seed = np.zeros((img_size, img_size), dtype=np.float32)
-    blur = cv2.GaussianBlur(gray, (9, 9), 2)
-    for rmin, rmax in [(15, 40), (40, 80), (80, 120)]:
-        circles = cv2.HoughCircles(
-            blur, cv2.HOUGH_GRADIENT,
-            dp=1.2, minDist=30,
-            param1=50, param2=40,
-            minRadius=rmin, maxRadius=rmax,
-        )
-        if circles is not None:
-            for cx, cy, r in circles[0]:
-                cv2.circle(seed, (int(cx), int(cy)), int(r * 1.1), 1.0, -1)
-    return cv2.GaussianBlur(seed, (21, 21), 0)
-
-
 def _hessian_convexity_map(gray):
     """
-    NOVO v7 — Mapa de convexidade via auto-valores da Hessiana.
-    Esfera: ambos auto-valores positivos e iguais (λ₁ ≈ λ₂ > 0) = "cúpula".
-    Folha plana: auto-valores próximos a zero = superfície flat.
-    Borda/nervura: λ₁ >> λ₂ ou sinais opostos = aresta direcional.
-
-    Retorna: mapa de "blob-ness" (fruta = alto, folha/borda = baixo).
-    Ref: Frangi et al. (1998) — Multiscale vessel enhancement filtering.
+    Mapa de 'blob-ness' via Hessiana.
+    Esfera: det>0 e trace>0. Folha plana: det≈0. Nervura: det<0.
+    Ref: Frangi et al. (1998).
     """
     gray_f = gray.astype(np.float64)
-    # Suaviza antes para remover ruído de alta frequência
     gray_blur = cv2.GaussianBlur(gray_f, (5, 5), 1.5)
 
-    # Derivadas de segunda ordem
     Dxx = cv2.Sobel(gray_blur, cv2.CV_64F, 2, 0, ksize=3)
     Dyy = cv2.Sobel(gray_blur, cv2.CV_64F, 0, 2, ksize=3)
     Dxy = cv2.Sobel(gray_blur, cv2.CV_64F, 1, 1, ksize=3)
 
-    # Auto-valores da Hessiana 2×2 em cada pixel
-    # λ = (Dxx+Dyy)/2 ± sqrt(((Dxx-Dyy)/2)² + Dxy²)
     trace = Dxx + Dyy
     det = Dxx * Dyy - Dxy ** 2
 
-    # "Blob-ness" = det > 0 e trace > 0 (ambos λ positivos = região convexa)
-    # Normalized pelo trace² para invariância a escala
     blobness = np.where(
         (det > 0) & (trace > 0),
         det / (trace ** 2 + 1e-9),
         0.0,
     ).astype(np.float32)
 
-    # Suaviza para capturar regiões, não pixels
-    blobness_smooth = cv2.GaussianBlur(blobness, (15, 15), 0)
-    return blobness_smooth
+    return cv2.GaussianBlur(blobness, (15, 15), 0)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MÁSCARA v7.1 — CORREÇÕES CRÍTICAS
+#
+# 1. Adiciona Cr-Cb (Okamoto 2009) e Hessiana (Frangi 1998) como critérios
+# 2. Votação 2/6 (era 3/5) — mais sensível a frutas em sombra
+# 3. Fallback Gabor+Cr-Cb quando máscara < 0.5%
+# 4. Filtro de circularidade ↑ 0.40 + solidity ≥ 0.75
+# 5. Morfologia mais suave (kernel 5×5, menos iterações)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def construir_mascara_fruta_verde(img_bgr):
     """
-    Máscara v7: 5 critérios (votação 3/5).
-    Critério A: Gabor Isotropy (Kurtulmus 2011)
-    Critério B: SATD liso (Zhao & Lee 2016)
-    Critério C: Laplaciano baixo (sem nervuras)
-    Critério D: LAB b* (carotenoides, Li 2016)
-    Critério E: Hough seed (Hu 2018) — mais rápido e limpo que razão de brilho
+    Máscara v7.1: 6 critérios (votação 2/6).
+    A: Gabor Isotropy  |  B: SATD liso  |  C: Laplaciano baixo
+    D: LAB b*          |  E: Hessiana blob-ness  |  F: Cr-Cb diff
     """
     h, w = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
 
+    # --- Critério A: Gabor Isotropy (Kurtulmus 2011) ---
     iso_map = _gabor_isotropy_map(gray)
-    crit_A = (iso_map >= float(np.percentile(iso_map, 60))).astype(np.float32)
+    crit_A = (iso_map >= float(np.percentile(iso_map, 55))).astype(np.float32)
 
+    # --- Critério B: SATD liso (Zhao & Lee 2016) ---
     satd_map_v = _satd_map(gray)
-    crit_B = (satd_map_v <= float(np.percentile(satd_map_v, 45))).astype(np.float32)
+    crit_B = (satd_map_v <= float(np.percentile(satd_map_v, 50))).astype(np.float32)
 
+    # --- Critério C: Laplaciano baixo (sem nervuras) ---
     lap_map = _laplacian_smooth_map(gray)
-    crit_C = (lap_map <= float(np.percentile(lap_map, 50))).astype(np.float32)
+    crit_C = (lap_map <= float(np.percentile(lap_map, 55))).astype(np.float32)
 
+    # --- Critério D: LAB b* (carotenoides) ---
     b_ch = lab[:, :, 2].astype(np.float32)
-    crit_D = (b_ch >= float(np.percentile(b_ch, 55))).astype(np.float32)
+    crit_D = (b_ch >= float(np.percentile(b_ch, 50))).astype(np.float32)
 
-    hough_seed = _hough_seed_map(gray, img_bgr.shape[0])
-    crit_E = (hough_seed > 0.05).astype(np.float32)
+    # --- Critério E: Hessiana blob-ness (Frangi 1998) — NOVO v7.1 ---
+    hess_map = _hessian_convexity_map(gray)
+    crit_E = (hess_map >= float(np.percentile(hess_map, 60))).astype(np.float32)
 
-    # Votação 3/5
-    voto = crit_A + crit_B + crit_C + crit_D + crit_E
-    mask_raw = (voto >= 3).astype(np.uint8) * 255
+    # --- Critério F: Cr-Cb discrimination (Okamoto & Lee 2009) — NOVO v7.1 ---
+    Cr = ycrcb[:, :, 1].astype(np.float32)
+    Cb = ycrcb[:, :, 2].astype(np.float32)
+    crcb_diff = Cr - Cb
+    crit_F = (crcb_diff >= float(np.percentile(crcb_diff, 45))).astype(np.float32)
 
-    # Morfologia
+    # --- Votação 2/6 (mais permissiva que 3/5) ---
+    voto = crit_A + crit_B + crit_C + crit_D + crit_E + crit_F
+    mask_raw = (voto >= 2).astype(np.uint8) * 255
+
+    # --- Morfologia suavizada ---
     k3 = np.ones((3, 3), np.uint8)
-    k9 = np.ones((9, 9), np.uint8)
-    mascara = cv2.morphologyEx(mask_raw, cv2.MORPH_OPEN, k3, iterations=2)
-    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, k9, iterations=3)
+    k5 = np.ones((5, 5), np.uint8)
+    mascara = cv2.morphologyEx(mask_raw, cv2.MORPH_OPEN, k3, iterations=1)
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, k5, iterations=2)
 
-    # Filtra por circularidade
+    # --- Filtro por circularidade + solidity (mais rigoroso) ---
     cnts, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mascara_filtrada = np.zeros_like(mascara)
     for cnt in cnts:
         area = cv2.contourArea(cnt)
-        if area < 150:
+        if area < 100:
             continue
         perim = cv2.arcLength(cnt, True)
         circ = 4 * np.pi * area / (perim ** 2 + 1e-6)
-        if circ >= 0.30:
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        solidity = area / (hull_area + 1e-6)
+        if circ >= 0.40 and solidity >= 0.75:
             cv2.drawContours(mascara_filtrada, [cnt], -1, 255, -1)
 
     prop = float(mascara_filtrada.sum()) / (255.0 * h * w)
+
+    # --- FALLBACK: máscara muito pequena → usa apenas A+F (mais robustos) ---
+    if prop < 0.005:
+        fallback_mask = ((crit_A + crit_F) >= 1).astype(np.uint8) * 255
+        fallback_mask = cv2.morphologyEx(fallback_mask, cv2.MORPH_CLOSE, k5, iterations=2)
+        cnts_fb, _ = cv2.findContours(fallback_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mascara_fb = np.zeros_like(mascara)
+        for cnt in cnts_fb:
+            area = cv2.contourArea(cnt)
+            if area < 80:
+                continue
+            perim = cv2.arcLength(cnt, True)
+            circ = 4 * np.pi * area / (perim ** 2 + 1e-6)
+            if circ >= 0.35:
+                cv2.drawContours(mascara_fb, [cnt], -1, 255, -1)
+        prop_fb = float(mascara_fb.sum()) / (255.0 * h * w)
+        if 0.005 <= prop_fb <= 0.45:
+            mascara_filtrada = mascara_fb
+            prop = prop_fb
+
+    # --- Proteção final ---
     if prop < 0.002 or prop > 0.45:
         mascara_filtrada = np.zeros_like(mascara_filtrada)
 
@@ -264,13 +269,10 @@ def construir_mascara_fruta_verde(img_bgr):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GRUPOS DE FEATURES
+# GRUPOS DE FEATURES (G1-G16) — mantidos da v7
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G1 — HSV: histogramas 16 bins + first-order por canal
-# (reduzido de 32 para 16 bins — suficiente, menos ruído)
-# ─────────────────────────────────────────────────────────────────────────────
+# G1 — HSV
 def features_hsv(img_bgr, hsv):
     feats = {}
     for i, nome in enumerate(["H", "S", "V"]):
@@ -282,9 +284,7 @@ def features_hsv(img_bgr, hsv):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G2 — RGB + LAB + YCbCr + razões de cor
-# ─────────────────────────────────────────────────────────────────────────────
+# G2 — RGB + LAB + YCbCr
 def features_rgb_lab(img_bgr):
     feats = {}
     for nome, idx in {"R": 2, "G": 1, "B": 0}.items():
@@ -312,9 +312,7 @@ def features_rgb_lab(img_bgr):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G3 — Canal V equalizado (CLAHE) dentro da máscara
-# ─────────────────────────────────────────────────────────────────────────────
+# G3 — Canal V equalizado
 def features_canal_v_eq(hsv, mascara):
     feats = {}
     V = hsv[:, :, 2]
@@ -337,12 +335,8 @@ def features_canal_v_eq(hsv, mascara):
     return feats, V_eq
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G4 — Bas-relief Maldonado (Sobel + Laplaciano, pipeline completo)
-# Ref: Maldonado & Barbosa (2016)
-# ─────────────────────────────────────────────────────────────────────────────
+# G4 — Bas-relief Maldonado
 def _bas_relief_map(V_eq):
-    """Pipeline bas-relief: Sobel_X + Laplaciano + Blur 11×11."""
     sobel_x = cv2.Sobel(V_eq, cv2.CV_64F, 1, 0, ksize=3)
     sobel_x_abs = np.abs(sobel_x).astype(np.float32)
     lap = cv2.Laplacian(V_eq, cv2.CV_64F, ksize=3)
@@ -353,7 +347,6 @@ def _bas_relief_map(V_eq):
 
 
 def _vertical_brightness_ratio(V, mascara=None):
-    """Razão brilho vertical: fruta esférica ≈ 1.2–1.8, folha ≈ 1.0."""
     h = V.shape[0]
     mid = h // 2
     if mascara is not None and mascara.sum() > 0:
@@ -403,7 +396,6 @@ def features_basrelief(V_eq, mascara):
     feats.update(_first_order(bas, "basrelief_maldonado_global"))
     feats.update(_first_order_mascara(bas, mascara, "basrelief_maldonado_fruta"))
 
-    # Razão de brilho vertical (Maldonado 2016)
     V_uint8 = V_eq.astype(np.uint8)
     ratio_global = _vertical_brightness_ratio(V_uint8)
     ratio_fruta = _vertical_brightness_ratio(V_uint8, mascara) if mascara.sum() > 0 else ratio_global
@@ -414,11 +406,7 @@ def features_basrelief(V_eq, mascara):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G5 — Gabor Circular (4 orientações × 2 freqs) + Isotropy Score
-# Principal discriminador fruta verde em fundo verde.
-# Ref: Kurtulmus et al. (2011)
-# ─────────────────────────────────────────────────────────────────────────────
+# G5 — Gabor Circular
 def features_gabor(gray):
     feats = {}
     orientacoes = [0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
@@ -455,9 +443,7 @@ def features_gabor(gray):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G6 — LBP (2 escalas)
-# ─────────────────────────────────────────────────────────────────────────────
+# G6 — LBP
 def features_lbp(gray):
     feats = {}
     for P, R_lbp, nome in [(8, 1, "s1"), (16, 2, "s2")]:
@@ -473,9 +459,7 @@ def features_lbp(gray):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G7 — GLCM Haralick (4 ângulos × 2 distâncias)
-# ─────────────────────────────────────────────────────────────────────────────
+# G7 — GLCM Haralick
 def features_glcm(gray):
     feats = {}
     gray_q = (gray // 4).astype(np.uint8)
@@ -498,10 +482,7 @@ def features_glcm(gray):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G8 — SATD como grupo dedicado
-# Ref: Zhao & Lee (2016) — 83.4% acurácia citrus verde
-# ─────────────────────────────────────────────────────────────────────────────
+# G8 — SATD
 def features_satd(gray, mascara):
     feats = {}
     satd_map = _satd_map(gray)
@@ -527,9 +508,7 @@ def features_satd(gray, mascara):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # G9 — HOG
-# ─────────────────────────────────────────────────────────────────────────────
 def features_hog(gray):
     feats = {}
     img_hog = cv2.resize(gray, (128, 128))
@@ -555,9 +534,7 @@ def features_hog(gray):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # G10 — Geometria de contornos + MSER
-# ─────────────────────────────────────────────────────────────────────────────
 def features_geometria(img_bgr, mascara):
     feats = {}
     k3 = np.ones((3, 3), np.uint8)
@@ -590,7 +567,6 @@ def features_geometria(img_bgr, mascara):
     feats["geom_n_blobs_circulares"] = float(n_circ)
     feats["geom_prop_blobs_circulares"] = float(n_circ / (len(circularities) + 1e-6))
 
-    # MSER com max_variation baixo (restritivo) — captura apenas regiões muito estáveis
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     try:
         mser = cv2.MSER_create(
@@ -622,11 +598,7 @@ def features_geometria(img_bgr, mascara):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G11 — Hough Circles (3 faixas de raio) — REATIVADO e INTEGRADO corretamente
-# NOTA: estava COMENTADO na v6 mas G14 tentava usar cnt_hough_n → BUG CRÍTICO.
-#       v7 reativa G11 e garante que G14 receba os valores corretos.
-# ─────────────────────────────────────────────────────────────────────────────
+# G11 — Hough Circles
 def features_hough_circles(img_bgr, mascara):
     feats = {}
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -671,9 +643,7 @@ def features_hough_circles(img_bgr, mascara):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G12 — Grade espacial 4×4
-# ─────────────────────────────────────────────────────────────────────────────
+# G12 — Grade espacial
 def features_grade_espacial(hsv, mascara, grid=(4, 4)):
     feats = {}
     V = hsv[:, :, 2].astype(np.float64)
@@ -704,9 +674,7 @@ def features_grade_espacial(hsv, mascara, grid=(4, 4)):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G13 — Multi-escala (208px e 104px)
-# ─────────────────────────────────────────────────────────────────────────────
+# G13 — Multi-escala
 def features_multiescala(img_bgr):
     feats = {}
     for fator, nome in [(0.5, "escala_208"), (0.25, "escala_104")]:
@@ -757,65 +725,124 @@ def features_multiescala(img_bgr):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G14 — Contagem Direta (CORRIGIDO: agora recebe n_hough corretamente)
+# ═══════════════════════════════════════════════════════════════════════════════
+# G14 — Contagem Direta v7.1 — CORREÇÕES CRÍTICAS
 #
-# CORREÇÃO CRÍTICA v7: O bug da v6 era que G11 estava comentado mas G14
-# referenciava feats.get("cnt_hough_n", 0) que nunca existia.
-# Agora G14 recebe n_hough como parâmetro calculado de G11.
-# ─────────────────────────────────────────────────────────────────────────────
+# 1. Watershed adaptativo (kernel/threshold dependem do tamanho da máscara)
+# 2. Proteção Hough: zera se máscara < 1% (evita falsos positivos em fundo)
+# 3. Área isotropia recalibrada: raio médio estimado da própria máscara
+# 4. Ensemble v7.1 com pesos adaptativos + truncamento de outliers
+# 5. Ensemble v7 legado preservado para compatibilidade
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _watershed_count(gray, mascara):
+    """
+    Watershed adaptativo: erosão e threshold ajustados ao tamanho da máscara.
+    Máscaras pequenas (< 2%) usam erosão suave para não desaparecer.
+    """
+    if mascara.sum() == 0:
+        return 0
+
+    prop = float(mascara.sum()) / (255.0 * mascara.shape[0] * mascara.shape[1])
+
+    # Kernel adaptativo
+    if prop < 0.02:
+        kernel = np.ones((3, 3), np.uint8)
+        iterations = 1
+    else:
+        kernel = np.ones((5, 5), np.uint8)
+        iterations = 2
+
+    eroded = cv2.erode(mascara, kernel, iterations=iterations)
+    if eroded.sum() == 0:
+        return 0
+
+    dist = ndimage.distance_transform_edt(eroded)
+    dist_norm = cv2.normalize(dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # Threshold adaptativo: mais sensível para máscaras pequenas
+    thr_pct = 40 if prop < 0.02 else 50
+    thr_dist = float(np.percentile(dist[dist > 0], thr_pct)) if np.any(dist > 0) else 5
+    _, markers_bin = cv2.threshold(dist_norm, int(thr_dist), 255, cv2.THRESH_BINARY)
+
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        markers_bin.astype(np.uint8), connectivity=8
+    )
+    area_min = 15 if prop < 0.02 else 20
+    n_valid = sum(
+        1 for i in range(1, n_labels)
+        if stats[i, cv2.CC_STAT_AREA] >= area_min
+    )
+    return n_valid
+
+
 def features_contagem_direta(img_bgr, mascara, n_hough_total, n_hough_mascara,
                              n_mser_circular):
     """
-    Consolida estimadores diretos de contagem.
-    Recebe n_hough e n_mser já calculados pelos grupos G11 e G10.
+    Consolida estimadores diretos de contagem com proteções v7.1.
     """
     feats = {}
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     V = hsv[:, :, 2]
 
-    # ── Estimador 1: Blob circular simples na máscara ──────────────────
+    prop_mascara = float(mascara.sum()) / (255.0 * mascara.shape[0] * mascara.shape[1])
+
+    # ── Estimador 1: Blob circular (filtros mais rigorosos) ──────────────────
     k3 = np.ones((3, 3), np.uint8)
     mask_c = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, k3)
     cnts, _ = cv2.findContours(mask_c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     n_blob = sum(
         1 for cnt in cnts
-        if cv2.contourArea(cnt) >= 150 and
-        4 * np.pi * cv2.contourArea(cnt) / (cv2.arcLength(cnt, True) ** 2 + 1e-6) >= 0.35
+        if cv2.contourArea(cnt) >= 100 and
+        4 * np.pi * cv2.contourArea(cnt) / (cv2.arcLength(cnt, True) ** 2 + 1e-6) >= 0.40
     )
     feats["cnt_blob_n"] = float(n_blob)
     feats["cnt_blob_log"] = float(np.log1p(n_blob))
     feats["cnt_blob_sqrt"] = float(np.sqrt(n_blob))
 
-    # ── Estimador 2: Watershed (NOVO v7) ──────────────────────────────
-    # Separa frutas sobrepostas usando transform. distância + marcadores.
-    # Muito mais robusto que blob simples para aglomerados de frutas.
+    # ── Estimador 2: Watershed adaptativo ──────────────────────────────
     n_watershed = _watershed_count(gray, mascara)
     feats["cnt_watershed_n"] = float(n_watershed)
     feats["cnt_watershed_log"] = float(np.log1p(n_watershed))
     feats["cnt_watershed_sqrt"] = float(np.sqrt(n_watershed))
 
-    # ── Estimador 3: Hough (recebido de G11) ──────────────────────────
+    # ── Estimador 3: Hough (proteção anti-ruído) ──────────────────────────
+    if prop_mascara < 0.01:
+        n_hough_total = 0
+        n_hough_mascara = 0
     feats["cnt_hough_n"] = float(n_hough_total)
     feats["cnt_hough_mascara_n"] = float(n_hough_mascara)
     feats["cnt_hough_log"] = float(np.log1p(n_hough_total))
     feats["cnt_hough_sqrt"] = float(np.sqrt(n_hough_total))
 
-    # ── Estimador 4: MSER (recebido de G10) ──────────────────────────
+    # ── Estimador 4: MSER ──────────────────────────
     feats["cnt_mser_n"] = float(n_mser_circular)
     feats["cnt_mser_log"] = float(np.log1p(n_mser_circular))
     feats["cnt_mser_sqrt"] = float(np.sqrt(n_mser_circular))
 
-    # ── Estimador 5: Área de isotropia ────────────────────────────────
+    # ── Estimador 5: Área de isotropia (recalibrado por escala real) ────
     iso_map = _gabor_isotropy_map(gray)
-    area_iso_alta = float((iso_map > 0.75).mean())
-    # Estima contagem por área: assume fruta média ocupa ~3% da imagem
-    n_est_area = area_iso_alta * IMG_SIZE * IMG_SIZE / (np.pi * 30 ** 2 + 1e-6)
-    feats["cnt_estimativa_area_iso"] = float(min(n_est_area, 200))
-    feats["cnt_area_iso_prop"] = area_iso_alta
+    area_iso_alta = float((iso_map > 0.70).mean())
 
-    # ── Estimador 6: Bas-relief + razão vertical (Maldonado 2016) ────
+    # Estima raio médio a partir da máscara atual
+    if mascara.sum() > 0:
+        cnts_m, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        areas_m = [cv2.contourArea(c) for c in cnts_m if cv2.contourArea(c) > 0]
+        if areas_m:
+            r_medio = np.sqrt(np.median(areas_m) / np.pi)
+            r_medio = float(np.clip(r_medio, 15, 60))
+        else:
+            r_medio = 30.0
+    else:
+        r_medio = 30.0
+
+    n_est_area = area_iso_alta * IMG_SIZE * IMG_SIZE / (np.pi * r_medio ** 2 + 1e-6)
+    feats["cnt_estimativa_area_iso"] = float(np.clip(n_est_area, 0, 200))
+    feats["cnt_area_iso_prop"] = area_iso_alta
+    feats["cnt_area_iso_rmedio"] = r_medio
+
+    # ── Estimador 6: Bas-relief + razão vertical ────
     V_uint8 = V.astype(np.uint8)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     V_eq = clahe.apply(V_uint8)
@@ -832,99 +859,73 @@ def features_contagem_direta(img_bgr, mascara, n_hough_total, n_hough_mascara,
             r = (np.mean(patch[:mid, :]) + 1e-6) / (np.mean(patch[mid:, :]) + 1e-6)
             ratio_map[i:i + step, j:j + step] = r
 
-    thr_bas = float(np.percentile(bas, 55))
-    candidatos = (bas >= thr_bas) & (ratio_map >= 1.18)
+    thr_bas = float(np.percentile(bas, 50))
+    candidatos = (bas >= thr_bas) & (ratio_map >= 1.15)
     candidatos_u8 = (candidatos * 255).astype(np.uint8)
     cnts2, _ = cv2.findContours(candidatos_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    n_basrelief = sum(1 for cnt in cnts2 if cv2.contourArea(cnt) >= 200)
+    n_basrelief = sum(1 for cnt in cnts2 if cv2.contourArea(cnt) >= 150)
     feats["cnt_basrelief_n"] = float(n_basrelief)
     feats["cnt_basrelief_log"] = float(np.log1p(n_basrelief))
     feats["cnt_basrelief_sqrt"] = float(np.sqrt(n_basrelief))
 
-    # ── Ensemble ponderado (todos os 6 estimadores) ───────────────────
-    # Pesos baseados em literatura: Hough(0.25), MSER(0.20), watershed(0.20),
-    # blob(0.15), bas-relief(0.10), area_iso(0.10)
-    ensemble = (
-            0.25 * n_hough_total +
-            0.20 * n_mser_circular +
-            0.20 * n_watershed +
-            0.15 * n_blob +
-            0.10 * n_basrelief +
-            0.10 * feats["cnt_estimativa_area_iso"]
-    )
-    feats["cnt_ensemble_v7"] = float(ensemble)
-    feats["cnt_ensemble_v7_log"] = float(np.log1p(ensemble))
-    feats["cnt_ensemble_v7_sqrt"] = float(np.sqrt(max(0, ensemble)))
+    # ── Ensemble v7.1 (robusto: pesos adaptativos + truncamento) ───────────────────
+    estimadores = np.array([
+        n_hough_total,
+        n_mser_circular,
+        n_watershed,
+        n_blob,
+        n_basrelief,
+        feats["cnt_estimativa_area_iso"]
+    ], dtype=np.float32)
 
-    # Razão ensemble / área ativa (normaliza por tamanho da cena)
+    # Mediana dos estimadores positivos como referência de escala
+    pos_vals = estimadores[estimadores > 0]
+    med = float(np.median(pos_vals)) if len(pos_vals) > 0 else 1.0
+
+    # Reduz peso de Hough se for outlier >3× mediana
+    w_hough = 0.05 if n_hough_total > 3 * max(med, 1.0) else 0.20
+    # Reduz peso de área isotropia se for outlier
+    w_area = 0.05 if feats["cnt_estimativa_area_iso"] > 3 * max(med, 1.0) else 0.10
+
+    ensemble_v71 = (
+        w_hough * n_hough_total +
+        0.20 * n_mser_circular +
+        0.20 * n_watershed +
+        0.20 * n_blob +
+        0.15 * n_basrelief +
+        w_area * feats["cnt_estimativa_area_iso"]
+    )
+    w_sum = w_hough + 0.20 + 0.20 + 0.20 + 0.15 + w_area
+    ensemble_v71 = ensemble_v71 / w_sum
+
+    feats["cnt_ensemble_v71"] = float(ensemble_v71)
+    feats["cnt_ensemble_v71_log"] = float(np.log1p(ensemble_v71))
+    feats["cnt_ensemble_v71_sqrt"] = float(np.sqrt(max(0, ensemble_v71)))
+
+    # ── Ensemble v7 legado (preservado para compatibilidade) ───────────────────
+    ensemble_legacy = (
+        0.25 * n_hough_total +
+        0.20 * n_mser_circular +
+        0.20 * n_watershed +
+        0.15 * n_blob +
+        0.10 * n_basrelief +
+        0.10 * feats["cnt_estimativa_area_iso"]
+    )
+    feats["cnt_ensemble_v7"] = float(ensemble_legacy)
+    feats["cnt_ensemble_v7_log"] = float(np.log1p(ensemble_legacy))
+    feats["cnt_ensemble_v7_sqrt"] = float(np.sqrt(max(0, ensemble_legacy)))
+
+    # Razão densidade
     n_celulas_ativas = max(float((mascara > 0).mean() * 16), 1e-6)
-    feats["cnt_density_per_cell"] = float(ensemble / n_celulas_ativas)
+    feats["cnt_density_per_cell"] = float(ensemble_v71 / n_celulas_ativas)
 
     return feats
 
 
-def _watershed_count(gray, mascara):
-    """
-    NOVO v7 — Conta frutas usando Watershed + transform. distância.
-    Ref: Technique from apple orchards (Sa et al. 2016 / Koirala et al. 2019).
-
-    Funciona melhor que blob detection quando frutas se tocam:
-    1. Erosão da máscara para criar marcadores certos
-    2. Transform. distância → picos = centros de frutas
-    3. Watershed separa regiões conectadas
-
-    Returns: int com estimativa de número de frutas
-    """
-    if mascara.sum() == 0:
-        return 0
-
-    # Erode fortemente para encontrar centros certeiros
-    kernel = np.ones((7, 7), np.uint8)
-    eroded = cv2.erode(mascara, kernel, iterations=2)
-    if eroded.sum() == 0:
-        return 0
-
-    # Transform. distância: pixels longe da borda têm valor alto
-    dist = ndimage.distance_transform_edt(eroded)
-    dist_norm = cv2.normalize(dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    # Picos locais = prováveis centros de frutas
-    # Usa threshold adaptativo: top 50% da distribuição de distâncias
-    thr_dist = float(np.percentile(dist[dist > 0], 50)) if np.any(dist > 0) else 5
-    _, markers_bin = cv2.threshold(dist_norm, int(thr_dist), 255, cv2.THRESH_BINARY)
-
-    # Conta componentes conexos nos marcadores
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        markers_bin.astype(np.uint8), connectivity=8
-    )
-    # Filtra por área mínima de marcador
-    n_valid = sum(
-        1 for i in range(1, n_labels)
-        if stats[i, cv2.CC_STAT_AREA] >= 20
-    )
-    return n_valid
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# G15 — Curvatura Hessiana (NOVO v7)
-#
-# Principal diferença entre esfera e folha:
-# Esfera: curvatura positiva uniforme em todas direções (blob-ness alto)
-# Folha: curvatura próxima de zero (plana) ou direcional (nervuras)
-# Borda de folha: curvatura oposta em λ₁ e λ₂ (ridge)
-#
-# Isso é invariante a iluminação, o que é CRÍTICO para verde-sobre-verde.
-# Ref: Frangi et al. (1998) multi-scale vessel/blob enhancement.
-# ─────────────────────────────────────────────────────────────────────────────
+# G15 — Curvatura Hessiana
 def features_curvatura_hessiana(gray, mascara):
-    """
-    Features de curvatura baseadas na Hessiana da imagem.
-    Multi-escala (σ=1, 3, 5) para capturar frutas de diferentes tamanhos.
-    """
     feats = {}
-
     for sigma in [1.5, 3.0, 5.0]:
-        # Suaviza com Gaussian antes de calcular derivadas (escala)
         gray_s = cv2.GaussianBlur(gray.astype(np.float64), (0, 0), sigma)
 
         Dxx = cv2.Sobel(gray_s, cv2.CV_64F, 2, 0, ksize=3)
@@ -934,7 +935,6 @@ def features_curvatura_hessiana(gray, mascara):
         trace = Dxx + Dyy
         det = Dxx * Dyy - Dxy ** 2
 
-        # Blob-ness (detecta esferas/discos)
         blobness = np.where(
             (det > 0) & (trace > 0),
             det / (trace ** 2 + 1e-9),
@@ -951,11 +951,8 @@ def features_curvatura_hessiana(gray, mascara):
         feats[f"hessian_s{s}_blob_p90"] = float(np.percentile(blobness_smooth, 90))
         feats[f"hessian_s{s}_prop_convex"] = float((det > 0).mean())
         feats[f"hessian_s{s}_prop_blob_high"] = float((blobness_smooth > np.percentile(blobness_smooth, 75)).mean())
-
-        # Dentro da máscara
         feats.update(_first_order_mascara(blob_u8, mascara, f"hessian_s{s}_fruta"))
 
-        # Razão convexidade fruta/fundo
         if mascara.sum() > 0:
             conv_fruta = float(det[mascara > 0].mean())
             conv_fundo = float(det[mascara == 0].mean()) if (mascara == 0).sum() > 0 else conv_fruta
@@ -966,51 +963,27 @@ def features_curvatura_hessiana(gray, mascara):
     return feats
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G16 — Chromaticidade Cr-Cb (NOVO v7)
-#
-# Ref: Okamoto & Lee (2009) "Green citrus detection using hyperspectral imaging"
-# e trabalhos derivados com câmera RGB.
-#
-# Mesmo que fruta e folha sejam visualmente verdes, na representação Cr-Cb:
-# - Folha verde pura: tende para Cb alto, Cr baixo
-# - Laranja verde (com pigmentos carotenoides internos): leve deslocamento
-#   em Cr (mais vermelho em relação ao fundo)
-# - A ELLIPSE Cr-Cb é uma representação compacta desse espaço
-#
-# O ExG (Excess Green) também é incluído aqui pois reflete diferença
-# espectral útil mesmo em verde-sobre-verde.
-# ─────────────────────────────────────────────────────────────────────────────
+# G16 — Chromaticidade Cr-Cb
 def features_chromaticidade_crcb(img_bgr, mascara):
-    """
-    Features de chromaticidade Cr-Cb para citrus verde.
-    Inclui estatísticas globais, dentro/fora da máscara e histogramas 2D.
-    """
     feats = {}
-
     ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
     Cr = ycrcb[:, :, 1].astype(np.float64)
     Cb = ycrcb[:, :, 2].astype(np.float64)
     Y = ycrcb[:, :, 0].astype(np.float64)
 
-    # ── Estatísticas globais Cr e Cb ──────────────────────────────────
     feats.update(_first_order(Cr, "cr_global"))
     feats.update(_first_order(Cb, "cb_global"))
 
-    # ── Diferença Cr-Cb (discriminador principal) ──────────────────────
     diff_crcb = Cr - Cb
     feats.update(_first_order(diff_crcb + 128, "crcb_diff"))
 
-    # ── Razão Cr/Cb ───────────────────────────────────────────────────
     razao_crcb = Cr / (Cb + 1e-7)
     feats["crcb_razao_mean"] = float(np.clip(razao_crcb, -5, 5).mean())
     feats["crcb_razao_std"] = float(np.clip(razao_crcb, -5, 5).std())
 
-    # ── Dentro da máscara ─────────────────────────────────────────────
     feats.update(_first_order_mascara(Cr.astype(np.uint8), mascara, "cr_fruta"))
     feats.update(_first_order_mascara(Cb.astype(np.uint8), mascara, "cb_fruta"))
 
-    # ── Contraste Cr fruta vs fundo ──────────────────────────────────
     if mascara.sum() > 0:
         cr_fruta = float(Cr[mascara > 0].mean())
         cr_fundo = float(Cr[mascara == 0].mean()) if (mascara == 0).sum() > 0 else cr_fruta
@@ -1026,8 +999,6 @@ def features_chromaticidade_crcb(img_bgr, mascara):
         np.sqrt((cr_fruta - cr_fundo) ** 2 + (cb_fruta - cb_fundo) ** 2)
     )
 
-    # ── Histograma 2D Cr×Cb (8×8 bins) ───────────────────────────────
-    # Captura a distribuição conjunta no espaço cromático
     Cr_u8 = np.clip(Cr, 0, 255).astype(np.uint8)
     Cb_u8 = np.clip(Cb, 0, 255).astype(np.uint8)
     hist2d, _, _ = np.histogram2d(
@@ -1039,7 +1010,6 @@ def features_chromaticidade_crcb(img_bgr, mascara):
         for j in range(8):
             feats[f"crcb_hist2d_{i}_{j}"] = float(hist2d_norm[i, j])
 
-    # ExG — Excess Green (sensível a diferença verde de folha vs verde de fruta)
     R = img_bgr[:, :, 2].astype(np.float64) + 1e-7
     G = img_bgr[:, :, 1].astype(np.float64) + 1e-7
     B = img_bgr[:, :, 0].astype(np.float64) + 1e-7
@@ -1071,38 +1041,35 @@ def _extrair_de_img(img_bgr):
     mascara = construir_mascara_fruta_verde(img_bgr)
 
     f = {}
-    f.update(features_hsv(img_bgr, hsv))  # G1
-    f.update(features_rgb_lab(img_bgr))  # G2
+    f.update(features_hsv(img_bgr, hsv))
+    f.update(features_rgb_lab(img_bgr))
     feats_v, V_eq = features_canal_v_eq(hsv, mascara)
-    f.update(feats_v)  # G3
-    f.update(features_basrelief(V_eq, mascara))  # G4
-    f.update(features_gabor(gray))  # G5
-    f.update(features_lbp(gray))  # G6
-    f.update(features_glcm(gray))  # G7
-    f.update(features_satd(gray, mascara))  # G8
-    f.update(features_hog(gray))  # G9
+    f.update(feats_v)
+    f.update(features_basrelief(V_eq, mascara))
+    f.update(features_gabor(gray))
+    f.update(features_lbp(gray))
+    f.update(features_glcm(gray))
+    f.update(features_satd(gray, mascara))
+    f.update(features_hog(gray))
 
-    # G10: guarda n_mser_circular para G14
     feats_geom = features_geometria(img_bgr, mascara)
-    f.update(feats_geom)  # G10
+    f.update(feats_geom)
     n_mser_circular = int(feats_geom.get("geom_mser_circular", 0))
 
-    # G11: guarda n_hough para G14 (BUG CRÍTICO v6: estava comentado!)
     feats_hough = features_hough_circles(img_bgr, mascara)
-    f.update(feats_hough)  # G11
+    f.update(feats_hough)
     n_hough_total = int(feats_hough.get("hough_total_estimado", 0))
     n_hough_mascara = int(feats_hough.get("hough_mascara_count", 0))
 
-    f.update(features_grade_espacial(hsv, mascara))  # G12
-    f.update(features_multiescala(img_bgr))  # G13
+    f.update(features_grade_espacial(hsv, mascara))
+    f.update(features_multiescala(img_bgr))
 
-    # G14: recebe n_hough e n_mser como parâmetros (resolve o bug)
     f.update(features_contagem_direta(
         img_bgr, mascara, n_hough_total, n_hough_mascara, n_mser_circular
-    ))  # G14
+    ))
 
-    f.update(features_curvatura_hessiana(gray, mascara))  # G15 (NOVO)
-    f.update(features_chromaticidade_crcb(img_bgr, mascara))  # G16 (NOVO)
+    f.update(features_curvatura_hessiana(gray, mascara))
+    f.update(features_chromaticidade_crcb(img_bgr, mascara))
 
     f["mascara_prop_fruta"] = float(mascara.mean()) / 255.0
     f["mascara_n_blobs"] = float(
@@ -1175,8 +1142,8 @@ def processar_split(registros, nome_split, aplicar_augmentacao=False):
                 "file_name": reg["file_name"],
                 "split": nome_split,
                 "contagem": cnt,
-                "contagem_log1p": float(np.log1p(cnt)),  # ← NOVO: target linearizado
-                "contagem_sqrt": float(np.sqrt(cnt)),  # ← NOVO: alternativo
+                "contagem_log1p": float(np.log1p(cnt)),
+                "contagem_sqrt": float(np.sqrt(cnt)),
                 "augmentacao": "original",
             }
             linha.update(feats)
@@ -1204,7 +1171,7 @@ def processar_split(registros, nome_split, aplicar_augmentacao=False):
             erros += 1
         except Exception as e:
             erros += 1
-            print(f"\n  [erro] {reg.get('file_name', '?')}: {e}")
+            print(f"\n  [erro] {reg.get('file_name', '?' )}: {e}")
 
         if (i + 1) % 50 == 0 or (i + 1) == total:
             print(f"  {nome_split}: {i + 1}/{total} "
@@ -1215,33 +1182,18 @@ def processar_split(registros, nome_split, aplicar_augmentacao=False):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SELEÇÃO AUTOMÁTICA DE FEATURES
-#
-# Resolve o problema de alta dimensionalidade que afeta SVR e MLP.
-# Etapas:
-#   1. Remove features com variância próxima de zero (constantes)
-#   2. Remove features altamente correlacionadas (|r| > 0.97)
-#
-# Esta etapa é feita ANTES da normalização e é FIT apenas no treino.
-# Isso previne data leakage e reduz o número de features de ~700 para ~300.
+# Seleção automática de features
 # ─────────────────────────────────────────────────────────────────────────────
 def selecionar_features(df_train, df_test, var_thr=VAR_THRESHOLD, corr_thr=CORR_THRESHOLD):
-    """
-    Aplica seleção automática de features.
-    Fit no treino, aplica em treino e teste.
-    Returns: df_train_sel, df_test_sel, lista de features removidas
-    """
     cols = [c for c in df_train.columns if c not in COLUNAS_META]
     removidas = []
 
-    # --- Etapa 1: Remove variância quasi-zero ---
     variancias = df_train[cols].var()
     cols_var_baixa = variancias[variancias < var_thr].index.tolist()
     removidas.extend([(c, "variancia_zero") for c in cols_var_baixa])
     cols = [c for c in cols if c not in cols_var_baixa]
     print(f"  [seleção] Removidas {len(cols_var_baixa)} features com variância < {var_thr}")
 
-    # --- Etapa 2: Remove correlação alta (greedy) ---
     corr_matrix = df_train[cols].corr().abs()
     upper = corr_matrix.where(
         np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
@@ -1253,15 +1205,14 @@ def selecionar_features(df_train, df_test, var_thr=VAR_THRESHOLD, corr_thr=CORR_
     removidas.extend([(c, "correlacao_alta") for c in cols_alta_corr])
     cols = [c for c in cols if c not in cols_alta_corr]
     print(f"  [seleção] Removidas {len(cols_alta_corr)} features com correlação > {corr_thr}")
-    print(
-        f"  [seleção] Features finais: {len(cols)} (de {len([c for c in df_train.columns if c not in COLUNAS_META])})")
+    print(f"  [seleção] Features finais: {len(cols)}")
 
     colunas_finais = COLUNAS_META + cols
     return df_train[colunas_finais], df_test[colunas_finais], removidas, cols
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Normalização MinMaxScaler [0,1] — fit apenas no treino
+# Normalização
 # ─────────────────────────────────────────────────────────────────────────────
 def normalizar(df_train, df_test):
     cols = [c for c in df_train.columns if c not in COLUNAS_META]
@@ -1292,7 +1243,7 @@ def normalizar(df_train, df_test):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metadados do dataset
+# Metadados
 # ─────────────────────────────────────────────────────────────────────────────
 def gerar_info(df_train, df_test, removidas, n_features_final):
     cols = [c for c in df_train.columns if c not in COLUNAS_META]
@@ -1302,8 +1253,7 @@ def gerar_info(df_train, df_test, removidas, n_features_final):
         "G1_hsv": [c for c in cols if c.startswith("hsv_")],
         "G2_rgb_lab_ycbcr": [c for c in cols if c.startswith(("rgb_", "lab_", "ycbcr_"))],
         "G3_canal_v_eq": [c for c in cols if c.startswith(("v_original", "v_eq", "v_razao"))],
-        "G4_basrelief": [c for c in cols if c.startswith(("sobel_", "laplace", "basrelief",
-                                                          "textura_", "brilho_"))],
+        "G4_basrelief": [c for c in cols if c.startswith(("sobel_", "laplace", "basrelief", "textura_", "brilho_"))],
         "G5_gabor": [c for c in cols if c.startswith("gabor_")],
         "G6_lbp": [c for c in cols if c.startswith("lbp_")],
         "G7_glcm": [c for c in cols if c.startswith("glcm_")],
@@ -1321,7 +1271,7 @@ def gerar_info(df_train, df_test, removidas, n_features_final):
 
     return {
         "gerado_em": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "versao": "7.0",
+        "versao": "7.1",
         "img_size": IMG_SIZE,
         "n_features_bruto": len([c for c in df_train.columns if c not in COLUNAS_META]),
         "n_features_apos_selecao": n_features_final,
@@ -1329,53 +1279,22 @@ def gerar_info(df_train, df_test, removidas, n_features_final):
         "n_removidas_correlacao": sum(1 for _, r in removidas if r == "correlacao_alta"),
         "n_por_grupo": {k: len(v) for k, v in grupos.items()},
         "targets_disponiveis": {
-            "contagem": "valor raw (int) — use com XGBoost objective='count:poisson'",
-            "contagem_log1p": "log1p(contagem) — use com SVR/MLP/XGBoost",
-            "contagem_sqrt": "sqrt(contagem) — alternativa para distribuição mais simétrica",
+            "contagem": "valor raw (int) — XGBoost count:poisson",
+            "contagem_log1p": "log1p(contagem) — SVR/MLP",
+            "contagem_sqrt": "sqrt(contagem) — alternativa",
         },
-        "bugs_corrigidos_da_v6": {
-            "G11_comentado": (
-                "G11 (Hough circles) estava COMENTADO no _extrair_de_img() mas G14 "
-                "referenciava cnt_hough_n → ensemble retornava zeros. CORRIGIDO."
+        "correcoes_v71": {
+            "mascara": (
+                "6 critérios (A-F), votação 2/6, fallback Gabor+Cr-Cb, "
+                "filtro circularidade ≥0.40 + solidity ≥0.75"
             ),
-            "G14_parametros": (
-                "G14 agora recebe n_hough e n_mser como parâmetros calculados pelos "
-                "grupos G11 e G10, eliminando dependência de feats.get() frágil."
-            ),
-        },
-        "novidades_v7": {
-            "G15_curvatura_hessiana": (
-                "Auto-valores da Hessiana: esfera = blob-ness alto (det>0, trace>0). "
-                "Folha = plana (det≈0). Nervura = ridge (det<0). "
-                "Multi-escala σ=1.5/3/5. Ref: Frangi et al. (1998)."
-            ),
-            "G16_chromaticidade_crcb": (
-                "Espaço Cr-Cb: discrimina verde de fruta vs verde de folha. "
-                "Histograma 2D 8×8 + ExG normalizado. "
-                "Ref: Okamoto & Lee (2009)."
-            ),
-            "watershed_count": (
-                "Novo estimador de contagem: transform. distância + watershed. "
-                "Separa frutas que se tocam, superior ao blob detection simples."
-            ),
-            "selecao_automatica": (
-                "Remove features com variância < 1e-5 e correlação > 0.97. "
-                "Reduz ~700 → ~300 features, crítico para SVR/MLP."
-            ),
-            "targets_transformados": (
-                "Adiciona contagem_log1p e contagem_sqrt. "
-                "IMPORTANTE: para SVR/MLP sempre use contagem_log1p. "
-                "Para XGBoost, use contagem com objective='count:poisson'."
-            ),
+            "watershed": "Kernel e threshold adaptativos ao tamanho da máscara",
+            "hough_protecao": "Zera Hough se máscara < 1% da imagem",
+            "area_iso_recalibrada": "Raio médio estimado da própria máscara, não fixo 30px",
+            "ensemble_v71": "Pesos adaptativos: reduz Hough/Área se outliers >3× mediana",
         },
         "recomendacao_modelo": {
             "melhor_opcao": "XGBoost com objective='count:poisson' ou LightGBM",
-            "por_que": (
-                "Contagem de frutas segue distribuição de Poisson (assimétrica, inteiros). "
-                "SVR/MLP assumem erros gaussianos — inadequado para count data. "
-                "XGBoost/LightGBM têm regularização nativa, lidam com features ruidosas "
-                "e convergem 2-3x mais rápido com MAPE muito menor."
-            ),
             "config_xgboost": {
                 "objective": "count:poisson",
                 "eval_metric": "mae",
@@ -1385,23 +1304,17 @@ def gerar_info(df_train, df_test, removidas, n_features_final):
                 "subsample": 0.8,
                 "colsample_bytree": 0.7,
             },
-            "config_se_insistir_svr": (
-                "Usar target=contagem_log1p, kernel='rbf', "
-                "C tunado via GridSearchCV em [0.1, 1, 10, 100]. "
-                "Aplicar exp(pred) - 1 na saída para voltar à escala original."
-            ),
         },
         "normalizacao": {
             "metodo": "MinMaxScaler sklearn",
             "range": "[0, 1]",
-            "fit_em": "treino apenas (sem data leakage)",
-            "nota": "Normalização NÃO é necessária para XGBoost/LightGBM/RandomForest",
+            "fit_em": "treino apenas",
         },
         "arquivos_gerados": {
-            "orandet_v7_train_raw.csv": "Treino sem normalização (incluindo augmentação)",
-            "orandet_v7_test_raw.csv": "Teste sem normalização",
-            "orandet_v7_train_norm.csv": "Treino normalizado [0,1]",
-            "orandet_v7_test_norm.csv": "Teste normalizado [0,1]",
+            "orandet_v71_train_raw.csv": "Treino sem normalização",
+            "orandet_v71_test_raw.csv": "Teste sem normalização",
+            "orandet_v71_train_norm.csv": "Treino normalizado [0,1]",
+            "orandet_v71_test_norm.csv": "Teste normalizado [0,1]",
         },
         "treino": {
             "n_originais": int(len(df_orig)),
@@ -1425,7 +1338,7 @@ def gerar_info(df_train, df_test, removidas, n_features_final):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main — Produz EXATAMENTE 4 arquivos de dataset
+# Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     data_dir = Path(DATA_DIR)
@@ -1434,8 +1347,8 @@ def main():
     ann_test = str(data_dir / "annotations_coco" / "instances_test.json")
 
     print("\n" + "═" * 70)
-    print("  OranDet v7 — Laranjas Verdes sobre Fundo Verde")
-    print("  Grupos: G1-G16 | Bug G11/G14 corrigido | Seleção automática")
+    print("  OranDet v7.1 — Correções de Máscara + Ensemble Robustificado")
+    print("  Grupos: G1-G16 | Máscara 2/6 + Fallback | Ensemble v7.1 adaptativo")
     print("  Saída: 4 datasets (train/test × raw/norm)")
     print("═" * 70)
 
@@ -1445,7 +1358,7 @@ def main():
     print(f"  Treino: {len(reg_train)} | Teste: {len(reg_test)}")
 
     print("\n[2/6] Extraindo features (treino)...")
-    df_train = processar_split(reg_train, "train", aplicar_augmentacao=True)
+    df_train = processar_split(reg_train, "train", aplicar_augmentacao=False)
 
     print("\n[3/6] Extraindo features (teste)...")
     df_test = processar_split(reg_test, "test", aplicar_augmentacao=False)
@@ -1453,45 +1366,40 @@ def main():
     print("\n[4/6] Seleção automática de features...")
     df_train_sel, df_test_sel, removidas, cols_final = selecionar_features(df_train, df_test)
 
-    print("\n[5/6] Salvando datasets RAW (sem normalização)...")
-    df_train_sel.to_csv(os.path.join(OUTPUT_DIR, "orandet_v7_train_raw.csv"), index=False)
-    df_test_sel.to_csv(os.path.join(OUTPUT_DIR, "orandet_v7_test_raw.csv"), index=False)
-    print(f"  Salvo: orandet_v7_train_raw.csv ({len(df_train_sel)} × {len(df_train_sel.columns)})")
-    print(f"  Salvo: orandet_v7_test_raw.csv  ({len(df_test_sel)} × {len(df_test_sel.columns)})")
+    print("\n[5/6] Salvando datasets RAW...")
+    df_train_sel.to_csv(os.path.join(OUTPUT_DIR, "orandet_v71_train_raw.csv"), index=False)
+    df_test_sel.to_csv(os.path.join(OUTPUT_DIR, "orandet_v71_test_raw.csv"), index=False)
+    print(f"  Salvo: orandet_v71_train_raw.csv ({len(df_train_sel)} × {len(df_train_sel.columns)})")
+    print(f"  Salvo: orandet_v71_test_raw.csv  ({len(df_test_sel)} × {len(df_test_sel.columns)})")
 
     print("\n[6/6] Normalizando [0,1] e salvando...")
     df_train_norm, df_test_norm, scaler = normalizar(df_train_sel, df_test_sel)
-    df_train_norm.to_csv(os.path.join(OUTPUT_DIR, "orandet_v7_train_norm.csv"), index=False)
-    df_test_norm.to_csv(os.path.join(OUTPUT_DIR, "orandet_v7_test_norm.csv"), index=False)
-    joblib.dump(scaler, os.path.join(OUTPUT_DIR, "orandet_v7_scaler.joblib"))
-    print(f"  Salvo: orandet_v7_train_norm.csv ({len(df_train_norm)} × {len(df_train_norm.columns)})")
-    print(f"  Salvo: orandet_v7_test_norm.csv  ({len(df_test_norm)} × {len(df_test_norm.columns)})")
+    df_train_norm.to_csv(os.path.join(OUTPUT_DIR, "orandet_v71_train_norm.csv"), index=False)
+    df_test_norm.to_csv(os.path.join(OUTPUT_DIR, "orandet_v71_test_norm.csv"), index=False)
+    joblib.dump(scaler, os.path.join(OUTPUT_DIR, "orandet_v71_scaler.joblib"))
+    print(f"  Salvo: orandet_v71_train_norm.csv ({len(df_train_norm)} × {len(df_train_norm.columns)})")
+    print(f"  Salvo: orandet_v71_test_norm.csv  ({len(df_test_norm)} × {len(df_test_norm.columns)})")
 
     print("\n  Salvando metadados...")
     info = gerar_info(df_train_sel, df_test_sel, removidas, len(cols_final))
-    with open(os.path.join(OUTPUT_DIR, "orandet_v7_info.json"), "w", encoding="utf-8") as fj:
+    with open(os.path.join(OUTPUT_DIR, "orandet_v71_info.json"), "w", encoding="utf-8") as fj:
         json.dump(info, fj, indent=2, ensure_ascii=False)
-    joblib.dump(cols_final, os.path.join(OUTPUT_DIR, "orandet_v7_feature_cols.joblib"))
+    joblib.dump(cols_final, os.path.join(OUTPUT_DIR, "orandet_v71_feature_cols.joblib"))
 
-    # ── Resumo final ──────────────────────────────────────────────────────
     print(f"\n{'═' * 70}")
-    print(f"  Features: {info['n_features_bruto']} brutas → "
-          f"{info['n_features_apos_selecao']} após seleção")
-    print(f"  Removidas: {info['n_removidas_variancia']} (var zero) + "
-          f"{info['n_removidas_correlacao']} (alta correlação)")
+    print(f"  Features: {info['n_features_bruto']} brutas → {info['n_features_apos_selecao']} após seleção")
+    print(f"  Removidas: {info['n_removidas_variancia']} (var zero) + {info['n_removidas_correlacao']} (alta correlação)")
     print(f"\n  Por grupo (após seleção):")
     for grupo, n in info["n_por_grupo"].items():
         if n > 0:
             print(f"    {grupo:<28} {n:>4} features")
-    print(f"\n  Treino: {info['treino']['n_originais']} imgs → "
-          f"{info['treino']['n_total_com_aug']} amostras (aug)")
-    print(f"  Teste:  {info['teste']['n_imagens']} imgs | "
-          f"média {info['teste']['cnt_media']:.1f} laranjas/img")
+    print(f"\n  Treino: {info['treino']['n_originais']} imgs → {info['treino']['n_total_com_aug']} amostras (aug)")
+    print(f"  Teste:  {info['teste']['n_imagens']} imgs | média {info['teste']['cnt_media']:.1f} laranjas/img")
     print(f"\n  Datasets gerados em: {OUTPUT_DIR}/")
-    print(f"    ├─ orandet_v7_train_raw.csv   ← use com XGBoost/LightGBM")
-    print(f"    ├─ orandet_v7_test_raw.csv    ← use com XGBoost/LightGBM")
-    print(f"    ├─ orandet_v7_train_norm.csv  ← use com SVR/MLP")
-    print(f"    └─ orandet_v7_test_norm.csv   ← use com SVR/MLP")
+    print(f"    ├─ orandet_v71_train_raw.csv   ← XGBoost/LightGBM")
+    print(f"    ├─ orandet_v71_test_raw.csv    ← XGBoost/LightGBM")
+    print(f"    ├─ orandet_v71_train_norm.csv  ← SVR/MLP")
+    print(f"    └─ orandet_v71_test_norm.csv   ← SVR/MLP")
     print(f"\n  ⚠  Target recomendado:")
     print(f"     XGBoost/LightGBM → 'contagem' + objective='count:poisson'")
     print(f"     SVR/MLP          → 'contagem_log1p' (aplicar exp-1 na saída)")
