@@ -23,18 +23,21 @@ warnings.filterwarnings("ignore")
 # CONFIGURAÇÃO
 # ─────────────────────────────────────────────
 # ─────────────────────────────────────────────
-DATASET_DIR = "dataset_preparado_v9"
+DATASET_DIR = "dataset_preparado_v80"
 OUTPUT_DIR  = "./modelos_svr"
 
 # Arquivos gerados pelo script de extração ajustado ao estilo Maldonado
-TRAIN_CSV   = os.path.join(DATASET_DIR, "orandet_v9_train_norm.csv")
-TEST_CSV    = os.path.join(DATASET_DIR, "orandet_v9_test_norm.csv")
+TRAIN_CSV   = os.path.join(DATASET_DIR, "orandet_v71_train_norm.csv")
+TEST_CSV    = os.path.join(DATASET_DIR, "orandet_v71_test_norm.csv")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Colunas que NÃO são features — só metadados
-COLUNAS_META = ["image_id", "file_name", "split", "contagem", "augmentacao", "contagem_log", "contagem_total"]
-
+COLUNAS_META = [
+    "image_id", "file_name", "split",
+    "contagem", "contagem_log1p", "contagem_sqrt", "augmentacao",
+    "contagem_log", "contagem_total"
+]
 # Número de features a selecionar antes do SVR.
 # Com o pipeline novo, o conjunto de features ficou mais rico.
 # Mantém a busca restrita o suficiente para evitar dimensionalidade excessiva,

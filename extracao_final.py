@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore")
 # CONFIGURAÇÃO
 # ─────────────────────────────────────────────────────────────────────────────
 DATA_DIR = "/Users/antonioreis/Downloads/dataverse_files"
-OUTPUT_DIR = "./dataset_preparado_v71"
+OUTPUT_DIR = "./dataset_preparado_v80"
 IMG_SIZE = 416
 
 COLUNAS_META = [
@@ -598,47 +598,121 @@ def features_geometria(img_bgr, mascara):
     return feats
 
 
-# G11 — Hough Circles
+# G11 — Hough Circles (v8.0: 6 faixas de raio + stats espaciais + overlap)
 def features_hough_circles(img_bgr, mascara):
+    """
+    Hough expandido v8.0:
+    - 6 faixas de raio não sobrepostas (antes: 3)
+    - raio médio por faixa, densidade por área
+    - distância média entre círculos e estimativa de sobreposição
+    - compatibilidade retroativa: hough_pequeno/medio/grande_count preservados
+    """
     feats = {}
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (9, 9), 2)
 
-    faixas = [(15, 40, "pequeno"), (40, 80, "medio"), (80, 120, "grande")]
+    # 6 faixas não sobrepostas — captura diversidade de tamanho de frutos
+    faixas_novas = [
+        (8,  18, "f1_micro"),
+        (18, 32, "f2_xpequeno"),
+        (32, 48, "f3_pequeno"),
+        (48, 68, "f4_medio"),
+        (68, 95, "f5_grande"),
+        (95, 135, "f6_xgrande"),
+    ]
     total_circ = 0
-    for rmin, rmax, nome in faixas:
+    todos_radii = []
+    todos_centros = []
+
+    for rmin, rmax, nome in faixas_novas:
+        min_dist = max(int(rmin * 1.2), 15)
         circles = cv2.HoughCircles(
             blur, cv2.HOUGH_GRADIENT,
-            dp=1.2, minDist=30,
-            param1=50, param2=40,
+            dp=1.2, minDist=min_dist,
+            param1=50, param2=38,
             minRadius=rmin, maxRadius=rmax,
         )
         n_v = int(len(circles[0])) if circles is not None else 0
         radii = [float(r) for _, _, r in circles[0]] if circles is not None else []
+        centros = [(float(x), float(y)) for x, y, _ in circles[0]] if circles is not None else []
+
         feats[f"hough_{nome}_count"] = float(n_v)
         feats[f"hough_{nome}_raio_mean"] = float(np.mean(radii)) if radii else 0.0
         feats[f"hough_{nome}_raio_std"] = float(np.std(radii)) if radii else 0.0
+        # densidade: círculos detectados por área de 100×100 px
+        feats[f"hough_{nome}_density"] = float(n_v / (IMG_SIZE * IMG_SIZE / 1e4))
         total_circ += n_v
+        todos_radii.extend(radii)
+        todos_centros.extend(centros)
+
+    # ── Compatibilidade retroativa (código legado usa esses nomes) ──────────
+    feats["hough_pequeno_count"] = feats["hough_f1_micro_count"] + feats["hough_f2_xpequeno_count"]
+    feats["hough_medio_count"]   = feats["hough_f3_pequeno_count"] + feats["hough_f4_medio_count"]
+    feats["hough_grande_count"]  = feats["hough_f5_grande_count"] + feats["hough_f6_xgrande_count"]
+    feats["hough_pequeno_raio_mean"] = feats["hough_f2_xpequeno_raio_mean"]
+    feats["hough_medio_raio_mean"]   = feats["hough_f4_medio_raio_mean"]
+    feats["hough_grande_raio_mean"]  = feats["hough_f5_grande_raio_mean"]
 
     feats["hough_total_estimado"] = float(total_circ)
     feats["hough_log_total"] = float(np.log1p(total_circ))
     feats["hough_sqrt_total"] = float(np.sqrt(total_circ))
     feats["hough_prop_pequenos"] = float(feats["hough_pequeno_count"] / (total_circ + 1e-7))
-    feats["hough_prop_medios"] = float(feats["hough_medio_count"] / (total_circ + 1e-7))
-    feats["hough_prop_grandes"] = float(feats["hough_grande_count"] / (total_circ + 1e-7))
+    feats["hough_prop_medios"]   = float(feats["hough_medio_count"] / (total_circ + 1e-7))
+    feats["hough_prop_grandes"]  = float(feats["hough_grande_count"] / (total_circ + 1e-7))
 
+    # ── Stats globais de raio ─────────────────────────────────────────────────
+    if todos_radii:
+        feats["hough_raio_global_mean"] = float(np.mean(todos_radii))
+        feats["hough_raio_global_std"]  = float(np.std(todos_radii))
+        feats["hough_raio_global_p25"]  = float(np.percentile(todos_radii, 25))
+        feats["hough_raio_global_p75"]  = float(np.percentile(todos_radii, 75))
+        feats["hough_raio_global_iqr"]  = feats["hough_raio_global_p75"] - feats["hough_raio_global_p25"]
+    else:
+        for k in ["mean", "std", "p25", "p75", "iqr"]:
+            feats[f"hough_raio_global_{k}"] = 0.0
+
+    # ── Distância média entre círculos detectados ─────────────────────────────
+    if len(todos_centros) >= 2:
+        centros_arr = np.array(todos_centros)
+        dists = []
+        n_c = len(centros_arr)
+        for k in range(n_c):
+            # só os 4 vizinhos mais próximos para controlar custo O(n²)
+            for ll in range(k + 1, min(k + 5, n_c)):
+                dists.append(float(np.linalg.norm(centros_arr[k] - centros_arr[ll])))
+        feats["hough_dist_media"] = float(np.mean(dists))
+        feats["hough_dist_std"]   = float(np.std(dists))
+    else:
+        feats["hough_dist_media"] = 0.0
+        feats["hough_dist_std"]   = 0.0
+
+    # ── Estimativa de sobreposição (proxy para oclusão) ───────────────────────
+    n_overlap = 0
+    if len(todos_centros) >= 2 and len(todos_radii) == len(todos_centros):
+        centros_arr = np.array(todos_centros)
+        radii_arr   = np.array(todos_radii)
+        n_c = len(centros_arr)
+        for k in range(n_c):
+            for ll in range(k + 1, n_c):
+                d = float(np.linalg.norm(centros_arr[k] - centros_arr[ll]))
+                if d < (radii_arr[k] + radii_arr[ll]) * 0.85:
+                    n_overlap += 1
+    feats["hough_overlap_est"]     = float(n_overlap)
+    feats["hough_overlap_log"]     = float(np.log1p(n_overlap))
+
+    # ── Hough sobre região da máscara ─────────────────────────────────────────
     if mascara.sum() > 0:
         gray_m = gray.copy()
         gray_m[mascara == 0] = 0
         blur_m = cv2.GaussianBlur(gray_m, (9, 9), 2)
         circles_m = cv2.HoughCircles(blur_m, cv2.HOUGH_GRADIENT,
-                                     dp=1.2, minDist=30, param1=50, param2=40,
-                                     minRadius=15, maxRadius=120)
+                                     dp=1.2, minDist=20, param1=50, param2=35,
+                                     minRadius=8, maxRadius=135)
         n_m = int(len(circles_m[0])) if circles_m is not None else 0
     else:
         n_m = 0
     feats["hough_mascara_count"] = float(n_m)
-    feats["hough_log_mascara"] = float(np.log1p(n_m))
+    feats["hough_log_mascara"]   = float(np.log1p(n_m))
 
     return feats
 
@@ -677,50 +751,230 @@ def features_grade_espacial(hsv, mascara, grid=(4, 4)):
 # G13 — Multi-escala
 def features_multiescala(img_bgr):
     feats = {}
+
+    escalas_data = {}
+
     for fator, nome in [(0.5, "escala_208"), (0.25, "escala_104")]:
+
         sz = (int(IMG_SIZE * fator), int(IMG_SIZE * fator))
-        img_r = cv2.resize(img_bgr, sz, interpolation=cv2.INTER_AREA)
+
+        img_r = cv2.resize(
+            img_bgr,
+            sz,
+            interpolation=cv2.INTER_AREA
+        )
+
         hsv_r = cv2.cvtColor(img_r, cv2.COLOR_BGR2HSV)
         gray_r = cv2.cvtColor(img_r, cv2.COLOR_BGR2GRAY)
 
-        hog_v = hog(gray_r, orientations=9,
-                    pixels_per_cell=(8, 8), cells_per_block=(2, 2),
-                    feature_vector=True, block_norm="L2-Hys")
+        mask_r = construir_mascara_fruta_verde(img_r)
+
+        # ============================================================
+        # HOG
+        # ============================================================
+
+        hog_v = hog(
+            gray_r,
+            orientations=9,
+            pixels_per_cell=(8, 8),
+            cells_per_block=(2, 2),
+            feature_vector=True,
+            block_norm="L2-Hys"
+        )
+
         feats[f"{nome}_hog_mean"] = float(hog_v.mean())
         feats[f"{nome}_hog_std"] = float(hog_v.std())
-        feats[f"{nome}_hog_energy"] = float(np.sum(hog_v ** 2))
+
+        # ============================================================
+        # FFT / frequência
+        # ============================================================
+
+        fft = np.fft.fft2(gray_r)
+        fft_shift = np.fft.fftshift(fft)
+
+        mag = np.log1p(np.abs(fft_shift))
+
+        feats[f"{nome}_fft_mean"] = float(mag.mean())
+        feats[f"{nome}_fft_std"] = float(mag.std())
+        feats[f"{nome}_fft_energy"] = float(np.mean(mag ** 2))
+
+        # ============================================================
+        # Laplacian
+        # ============================================================
+
+        lap = cv2.Laplacian(gray_r, cv2.CV_32F)
+
+        feats[f"{nome}_lap_mean"] = float(np.mean(np.abs(lap)))
+        feats[f"{nome}_lap_std"] = float(np.std(lap))
+
+        # ============================================================
+        # HSV simplificado
+        # ============================================================
 
         for ci, cn in enumerate(["H", "S", "V"]):
-            hist = cv2.calcHist([hsv_r], [ci], None, [16], [0, 256]).flatten()
-            hist = hist / (hist.sum() + 1e-7)
-            for b, val in enumerate(hist):
-                feats[f"{nome}_hsv_{cn}_b{b:02d}"] = float(val)
 
-        mask_r = construir_mascara_fruta_verde(img_r)
-        feats[f"{nome}_prop_fruta"] = float(mask_r.mean()) / 255.0
+            hist = cv2.calcHist(
+                [hsv_r],
+                [ci],
+                None,
+                [8],
+                [0, 256]
+            ).flatten()
+
+            hist = hist / (hist.sum() + 1e-7)
+
+            feats[f"{nome}_{cn}_entropy"] = float(
+                -np.sum(hist * np.log2(hist + 1e-9))
+            )
+
+            feats[f"{nome}_{cn}_maxbin"] = float(hist.max())
+
+        # ============================================================
+        # máscara
+        # ============================================================
+
+        prop_fruta = float(mask_r.mean()) / 255.0
+
+        feats[f"{nome}_prop_fruta"] = prop_fruta
+
+        # ============================================================
+        # blobs
+        # ============================================================
 
         k3 = np.ones((3, 3), np.uint8)
-        mask_c = cv2.morphologyEx(mask_r, cv2.MORPH_OPEN, k3)
-        cnts, _ = cv2.findContours(mask_c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        n_blobs = sum(
-            1 for cnt in cnts
-            if cv2.contourArea(cnt) >= 10 and
-            4 * np.pi * cv2.contourArea(cnt) / (cv2.arcLength(cnt, True) ** 2 + 1e-6) >= 0.35
+
+        mask_c = cv2.morphologyEx(
+            mask_r,
+            cv2.MORPH_OPEN,
+            k3
         )
+
+        cnts, _ = cv2.findContours(
+            mask_c,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        areas = []
+
+        n_blobs = 0
+
+        for cnt in cnts:
+
+            area = cv2.contourArea(cnt)
+
+            if area < 10:
+                continue
+
+            circ = (
+                4 * np.pi * area /
+                (cv2.arcLength(cnt, True) ** 2 + 1e-6)
+            )
+
+            if circ >= 0.35:
+                n_blobs += 1
+                areas.append(area)
+
         feats[f"{nome}_n_blobs"] = float(n_blobs)
-        feats[f"{nome}_log_blobs"] = float(np.log1p(n_blobs))
+
+        if len(areas) > 0:
+
+            feats[f"{nome}_blob_area_mean"] = float(np.mean(areas))
+            feats[f"{nome}_blob_area_std"] = float(np.std(areas))
+
+        else:
+
+            feats[f"{nome}_blob_area_mean"] = 0.0
+            feats[f"{nome}_blob_area_std"] = 0.0
+
+        # ============================================================
+        # spatial pyramid simples (2x2)
+        # ============================================================
+
+        h, w = gray_r.shape
+
+        idx = 0
+
+        for y0, y1 in [(0, h//2), (h//2, h)]:
+            for x0, x1 in [(0, w//2), (w//2, w)]:
+
+                patch_mask = mask_r[y0:y1, x0:x1]
+
+                prop_patch = float(patch_mask.mean()) / 255.0
+
+                feats[f"{nome}_patch{idx}_prop"] = prop_patch
+
+                idx += 1
+
+        # ============================================================
+        # Gabor isotropia
+        # ============================================================
 
         for lam in [8, 15]:
+
             resps = []
-            for theta in [0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]:
-                k = cv2.getGaborKernel((15, 15), 3.0, theta, float(lam), 1.0, 0)
-                r = np.abs(cv2.filter2D(gray_r, cv2.CV_64F, k))
+
+            for theta in [
+                0,
+                np.pi / 4,
+                np.pi / 2,
+                3 * np.pi / 4
+            ]:
+
+                k = cv2.getGaborKernel(
+                    (15, 15),
+                    3.0,
+                    theta,
+                    float(lam),
+                    1.0,
+                    0
+                )
+
+                r = np.abs(
+                    cv2.filter2D(gray_r, cv2.CV_64F, k)
+                )
+
                 resps.append(r)
+
             stk = np.stack(resps, axis=0)
+
             cv_ = stk.std(axis=0) / (stk.mean(axis=0) + 1e-9)
+
             iso = 1.0 - np.clip(cv_, 0, 1)
-            feats[f"{nome}_gabor_lam{lam}_isotropy_mean"] = float(iso.mean())
-            feats[f"{nome}_gabor_lam{lam}_prop_high"] = float((iso > 0.7).mean())
+
+            feats[f"{nome}_gabor_iso_mean_{lam}"] = float(iso.mean())
+            feats[f"{nome}_gabor_iso_std_{lam}"] = float(iso.std())
+
+        # salvar para relações entre escalas
+        escalas_data[nome] = {
+            "prop": prop_fruta,
+            "blobs": n_blobs,
+            "hog_mean": hog_v.mean(),
+            "fft_mean": mag.mean()
+        }
+
+    # ============================================================
+    # RELAÇÕES ENTRE ESCALAS
+    # ============================================================
+
+    e208 = escalas_data["escala_208"]
+    e104 = escalas_data["escala_104"]
+
+    feats["multi_ratio_blobs"] = float(
+        e208["blobs"] / (e104["blobs"] + 1e-6)
+    )
+
+    feats["multi_ratio_prop"] = float(
+        e208["prop"] / (e104["prop"] + 1e-6)
+    )
+
+    feats["multi_delta_hog"] = float(
+        e208["hog_mean"] - e104["hog_mean"]
+    )
+
+    feats["multi_delta_fft"] = float(
+        e208["fft_mean"] - e104["fft_mean"]
+    )
 
     return feats
 
@@ -1034,51 +1288,282 @@ def features_chromaticidade_crcb(img_bgr, mascara):
 # Pipeline completo por imagem
 # ─────────────────────────────────────────────────────────────────────────────
 def _extrair_de_img(img_bgr):
+
+    # ============================================================
+    # Pré-processamento base
+    # ============================================================
+
     img_bgr = cv2.resize(img_bgr, (IMG_SIZE, IMG_SIZE))
+
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
     mascara = construir_mascara_fruta_verde(img_bgr)
 
     f = {}
-    f.update(features_hsv(img_bgr, hsv))
-    f.update(features_rgb_lab(img_bgr))
-    feats_v, V_eq = features_canal_v_eq(hsv, mascara)
-    f.update(feats_v)
-    f.update(features_basrelief(V_eq, mascara))
-    f.update(features_gabor(gray))
-    f.update(features_lbp(gray))
-    f.update(features_glcm(gray))
-    f.update(features_satd(gray, mascara))
+
+    # ============================================================
+    # FEATURES MAIS IMPORTANTES (manter e fortalecer)
+    # ============================================================
+
+    # ------------------------------------------------------------
+    # HOG / estrutura
+    # ------------------------------------------------------------
+
     f.update(features_hog(gray))
 
-    feats_geom = features_geometria(img_bgr, mascara)
-    f.update(feats_geom)
-    n_mser_circular = int(feats_geom.get("geom_mser_circular", 0))
+    # ------------------------------------------------------------
+    # MULTIESCALA (MUITO IMPORTANTE)
+    # ------------------------------------------------------------
 
-    feats_hough = features_hough_circles(img_bgr, mascara)
-    f.update(feats_hough)
-    n_hough_total = int(feats_hough.get("hough_total_estimado", 0))
-    n_hough_mascara = int(feats_hough.get("hough_mascara_count", 0))
-
-    f.update(features_grade_espacial(hsv, mascara))
     f.update(features_multiescala(img_bgr))
 
-    f.update(features_contagem_direta(
-        img_bgr, mascara, n_hough_total, n_hough_mascara, n_mser_circular
-    ))
+    # ------------------------------------------------------------
+    # LBP (muito forte no SVR)
+    # ------------------------------------------------------------
+
+    f.update(features_lbp(gray))
+
+    # ------------------------------------------------------------
+    # GLCM
+    # ------------------------------------------------------------
+
+    f.update(features_glcm(gray))
+
+    # ------------------------------------------------------------
+    # Gabor isotropia
+    # ------------------------------------------------------------
+
+    f.update(features_gabor(gray))
+
+    # ------------------------------------------------------------
+    # Hessian / blobness
+    # ------------------------------------------------------------
 
     f.update(features_curvatura_hessiana(gray, mascara))
-    f.update(features_chromaticidade_crcb(img_bgr, mascara))
 
-    f["mascara_prop_fruta"] = float(mascara.mean()) / 255.0
+    # ------------------------------------------------------------
+    # Hough
+    # ------------------------------------------------------------
+
+    feats_hough = features_hough_circles(img_bgr, mascara)
+
+    f.update(feats_hough)
+
+    n_hough_total = int(
+        feats_hough.get("hough_total_estimado", 0)
+    )
+
+    n_hough_mascara = int(
+        feats_hough.get("hough_mascara_count", 0)
+    )
+
+    # ============================================================
+    # FEATURES SECUNDÁRIAS (reduzidas)
+    # ============================================================
+
+    # ------------------------------------------------------------
+    # HSV
+    # (manter porque XGBoost gosta)
+    # ------------------------------------------------------------
+
+    f.update(features_hsv(img_bgr, hsv))
+
+    # ------------------------------------------------------------
+    # RGB/LAB/YCbCr
+    # ------------------------------------------------------------
+
+    f.update(features_rgb_lab(img_bgr))
+
+    # ------------------------------------------------------------
+    # Canal V
+    # ------------------------------------------------------------
+
+    feats_v, V_eq = features_canal_v_eq(hsv, mascara)
+
+    f.update(feats_v)
+
+    # ------------------------------------------------------------
+    # Bas-relief
+    # ------------------------------------------------------------
+
+    f.update(features_basrelief(V_eq, mascara))
+
+    # ============================================================
+    # FEATURES QUE DEVEM CONTINUAR
+    # ============================================================
+
+    # ------------------------------------------------------------
+    # Contagem direta
+    # ------------------------------------------------------------
+
+    n_mser_circular = int(
+        f.get("geom_mser_circular", 0)
+    )
+
+    f.update(
+        features_contagem_direta(
+            img_bgr,
+            mascara,
+            n_hough_total,
+            n_hough_mascara,
+            n_mser_circular
+        )
+    )
+
+    # ------------------------------------------------------------
+    # Grade espacial
+    # ------------------------------------------------------------
+
+    f.update(features_grade_espacial(hsv, mascara))
+
+    # ============================================================
+    # FFT / frequência (NOVO)
+    # ============================================================
+
+    fft = np.fft.fft2(gray)
+
+    fft_shift = np.fft.fftshift(fft)
+
+    mag = np.log1p(np.abs(fft_shift))
+
+    f["fft_mean"] = float(mag.mean())
+    f["fft_std"] = float(mag.std())
+    f["fft_energy"] = float(np.mean(mag ** 2))
+
+    # baixa frequência central
+    h, w = mag.shape
+
+    cy, cx = h // 2, w // 2
+
+    low = mag[
+        cy - 20:cy + 20,
+        cx - 20:cx + 20
+    ]
+
+    f["fft_lowfreq_mean"] = float(low.mean())
+
+    # alta frequência periférica
+    high = mag.copy()
+
+    high[
+        cy - 20:cy + 20,
+        cx - 20:cx + 20
+    ] = 0
+
+    f["fft_highfreq_mean"] = float(
+        high.mean()
+    )
+
+    # ============================================================
+    # Laplacian / detalhe estrutural (NOVO)
+    # ============================================================
+
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
+
+    abs_lap = np.abs(lap)
+
+    f["lap_mean"] = float(abs_lap.mean())
+    f["lap_std"] = float(abs_lap.std())
+    f["lap_p90"] = float(np.percentile(abs_lap, 90))
+
+    # ============================================================
+    # Spatial pyramid simples (NOVO)
+    # ============================================================
+
+    h, w = gray.shape
+
+    idx = 0
+
+    for y0, y1 in [(0, h // 2), (h // 2, h)]:
+        for x0, x1 in [(0, w // 2), (w // 2, w)]:
+
+            patch_gray = gray[y0:y1, x0:x1]
+
+            patch_mask = mascara[y0:y1, x0:x1]
+
+            prop = float(
+                patch_mask.mean()
+            ) / 255.0
+
+            f[f"spatial_{idx}_prop"] = prop
+
+            gx = cv2.Sobel(
+                patch_gray,
+                cv2.CV_32F,
+                1,
+                0
+            )
+
+            gy = cv2.Sobel(
+                patch_gray,
+                cv2.CV_32F,
+                0,
+                1
+            )
+
+            grad = np.sqrt(gx ** 2 + gy ** 2)
+
+            f[f"spatial_{idx}_grad_mean"] = float(
+                grad.mean()
+            )
+
+            f[f"spatial_{idx}_grad_std"] = float(
+                grad.std()
+            )
+
+            idx += 1
+
+    # ============================================================
+    # Features globais de máscara
+    # ============================================================
+
+    f["mascara_prop_fruta"] = float(
+        mascara.mean()
+    ) / 255.0
+
+    contours, _ = cv2.findContours(
+        mascara,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
     f["mascara_n_blobs"] = float(
-        len(cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0])
+        len(contours)
+    )
+
+    # ============================================================
+    # Densidade estrutural (NOVO)
+    # ============================================================
+
+    prop = f["mascara_prop_fruta"]
+
+    blobs = max(
+        f["mascara_n_blobs"],
+        1e-6
+    )
+
+    f["density_blob_ratio"] = float(
+        prop / blobs
+    )
+
+    # ============================================================
+    # Relação HOG/frequência (NOVO)
+    # ============================================================
+
+    hog_mean = float(
+        f.get("hog_mean", 0.0)
+    )
+
+    fft_mean = float(
+        f.get("fft_mean", 0.0)
+    )
+
+    f["hog_fft_ratio"] = float(
+        hog_mean / (fft_mean + 1e-6)
     )
 
     return f
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Augmentação
 # ─────────────────────────────────────────────────────────────────────────────

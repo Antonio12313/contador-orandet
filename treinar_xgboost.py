@@ -14,7 +14,7 @@ from sklearn.model_selection import KFold
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURAÇÃO
 # ─────────────────────────────────────────────────────────────────────────────
-DATASET_DIR = "./dataset_preparado_v71"
+DATASET_DIR = "./dataset_preparado_v80"
 OUTPUT_DIR = "./resultados_xgboost_v5"
 TARGET_COL = "contagem"
 META_COLS = [
