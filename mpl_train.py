@@ -1,6 +1,11 @@
 import warnings
+
 warnings.filterwarnings("ignore")
 
+import os
+import json
+import time
+import importlib.metadata
 import numpy as np
 import pandas as pd
 import joblib
@@ -10,43 +15,36 @@ from datetime import datetime
 from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, make_scorer
-from sklearn.experimental import enable_halving_search_cv          # ← OBRIGATÓRIO antes do import abaixo
+from sklearn.experimental import enable_halving_search_cv
 from sklearn.model_selection import HalvingRandomSearchCV
 from scipy.stats import loguniform
 
 DATASET_DIR = "dataset_preparado_v80"
-TRAIN_CSV   = f"{DATASET_DIR}/orandet_v71_train_norm.csv"
-TEST_CSV    = f"{DATASET_DIR}/orandet_v71_test_norm.csv"
-OUTPUT_DIR  = "./resultados_mlp_v8"
+TRAIN_CSV = f"{DATASET_DIR}/orandet_v80_train_norm.csv"
+TEST_CSV = f"{DATASET_DIR}/orandet_v80_test_norm.csv"
+OUTPUT_DIR = "./resultados_mlp_v9"
 
 COLUNAS_META = [
     "image_id", "file_name", "split",
     "contagem", "contagem_log1p", "contagem_sqrt", "augmentacao",
-    "contagem_log", "contagem_total"
 ]
 SEED = 42
 np.random.seed(SEED)
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MÉTRICA
-# ══════════════════════════════════════════════════════════════════════════════
+
+# MÉTRICA PARA GRID SEARCH (escala log → original via expm1)
 
 def mape_original_scale(y_true_log, y_pred_log, epsilon=1.0):
-    """Avalia MAPE na escala original, mesmo que treino seja em log."""
+    """MAPE na escala original — usado no CV onde o target ainda está em log1p."""
     y_true = np.expm1(np.array(y_true_log, dtype=np.float64))
     y_pred = np.expm1(np.array(y_pred_log, dtype=np.float64))
     y_pred = np.maximum(y_pred, 0.0)
-    denom  = np.maximum(np.abs(y_true), epsilon)
+    denom = np.maximum(np.abs(y_true), epsilon)
     return float(np.mean(np.abs(y_true - y_pred) / denom) * 100.0)
 
-mape_scorer = make_scorer(mape_original_scale, greater_is_better=False)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ESPAÇO DE BUSCA
-# Usamos loguniform para alpha e lr_init — amostragem contínua em escala log,
-# mais eficiente que uma grade discreta de 3-4 valores.
-# ══════════════════════════════════════════════════════════════════════════════
+mape_scorer = make_scorer(mape_original_scale, greater_is_better=False)
 
 PARAM_DIST = {
     "hidden_layer_sizes": [
@@ -55,76 +53,84 @@ PARAM_DIST = {
         (256, 128, 64), (128, 64, 32), (256, 128, 32),
         (128, 128, 128), (64, 64, 64),
     ],
-    "activation"         : ["relu", "tanh"],
-    "solver"             : ["adam"],
-    "alpha"              : loguniform(1e-4, 5e-2),
-    "learning_rate"      : ["adaptive"],
-    "learning_rate_init" : loguniform(1e-4, 1e-3),
-    "max_iter"           : [500],          # early_stopping cuida do resto no CV
-    "n_iter_no_change"   : [20],
-    "random_state"       : [SEED],
+    "activation": ["relu", "tanh"],
+    "solver": ["adam"],
+    "alpha": loguniform(1e-4, 5e-2),
+    "learning_rate": ["adaptive"],
+    "learning_rate_init": loguniform(1e-4, 1e-3),
+    "max_iter": [500],
+    "n_iter_no_change": [20],
+    "random_state": [SEED],
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CARREGAMENTO DOS DADOS
-# ══════════════════════════════════════════════════════════════════════════════
+PARAM_DIST_DOC = {
+    "hidden_layer_sizes": [
+        "(64,)", "(128,)", "(256,)",
+        "(128, 64)", "(256, 128)", "(256, 64)", "(512, 128)",
+        "(256, 128, 64)", "(128, 64, 32)", "(256, 128, 32)",
+        "(128, 128, 128)", "(64, 64, 64)",
+    ],
+    "activation": ["relu", "tanh"],
+    "solver": ["adam"],
+    "alpha": "loguniform(1e-4, 5e-2)",
+    "learning_rate": ["adaptive"],
+    "learning_rate_init": "loguniform(1e-4, 1e-3)",
+    "max_iter": [500],
+    "n_iter_no_change": [20],
+    "random_state": [SEED],
+}
 
+
+# CARREGAMENTO
 def carregar_dados():
     print("[1/4] Carregando dados...")
 
     df_train = pd.read_csv(TRAIN_CSV)
-    df_test  = pd.read_csv(TEST_CSV)
+    df_test = pd.read_csv(TEST_CSV)
 
     feat_cols = [c for c in df_train.columns if c not in COLUNAS_META]
 
-    # CV apenas com originais — evita data leakage entre aug e original
+    # CV apenas com originais — evita leakage entre aug e original
     df_orig = df_train[df_train["augmentacao"] == "original"].copy()
-    X_cv    = df_orig[feat_cols].values.astype(np.float32)
-    y_cv    = df_orig["contagem_log1p"].values.astype(np.float64)   # log(1+y)
+    X_cv = df_orig[feat_cols].values.astype(np.float32)
+    y_cv = df_orig["contagem_log1p"].values.astype(np.float64)
 
     # Treino final com augmentação completa
-    X_full  = df_train[feat_cols].values.astype(np.float32)
-    y_full  = df_train["contagem_log1p"].values.astype(np.float64)  # log(1+y)
+    X_full = df_train[feat_cols].values.astype(np.float32)
+    y_full = df_train["contagem_log1p"].values.astype(np.float64)
 
-    # Teste: target na escala ORIGINAL para avaliação final
-    X_test  = df_test[feat_cols].values.astype(np.float32)
-    y_test  = df_test["contagem"].values.astype(np.float64)
+    # Para avaliação de treino (escala original)
+    y_full_orig = df_train["contagem"].values.astype(np.float64)
 
-    nomes_test = df_test["file_name"].values  if "file_name" in df_test.columns else None
-    ids_test   = df_test["image_id"].values   if "image_id"  in df_test.columns else None
+    # Teste
+    X_test = df_test[feat_cols].values.astype(np.float32)
+    y_test = df_test["contagem"].values.astype(np.float64)
 
-    print(f"  Features (v8)     : {len(feat_cols)}")
+    nomes_test = df_test["file_name"].values if "file_name" in df_test.columns else None
+    ids_test = df_test["image_id"].values if "image_id" in df_test.columns else None
+
+    print(f"  Features          : {len(feat_cols)}")
     print(f"  Treino CV (orig)  : {X_cv.shape[0]} imagens")
     print(f"  Treino full+aug   : {X_full.shape[0]} amostras")
     print(f"  Teste             : {X_test.shape[0]} imagens")
-    print(f"  Target treino     : log(1+contagem), min={y_cv.min():.3f} max={y_cv.max():.3f}")
+    print(f"  Target            : log1p(contagem)  |  inversa: expm1(pred)")
     print(f"  Contagem teste    : min={y_test.min():.0f} max={y_test.max():.0f} "
           f"média={y_test.mean():.1f}")
 
-    return X_cv, y_cv, X_full, y_full, X_test, y_test, feat_cols, nomes_test, ids_test
+    return (X_cv, y_cv, X_full, y_full, y_full_orig,
+            X_test, y_test, feat_cols, nomes_test, ids_test)
 
-# ══════════════════════════════════════════════════════════════════════════════
+
 # BUSCA DE HIPERPARÂMETROS
-#
-# HalvingRandomSearchCV: começa com poucos recursos (dados), elimina os piores
-# candidatos progressivamente e concentra o orçamento nos mais promissores.
-# Resultado: ~10-15x mais rápido que GridSearchCV com perda mínima de qualidade.
-#
-# early_stopping=True no estimador: cada fold para antes de max_iter se não
-# melhorar por n_iter_no_change épocas — evita 500 iterações desnecessárias.
-# ══════════════════════════════════════════════════════════════════════════════
 
 def rodar_grid_search(X_cv, y_cv):
-    print(f"\n[2/4] HalvingRandomSearchCV — MLPRegressor (v8)")
-    print(f"  Candidatos iniciais : 60  (era 288 no GridSearch)")
-    print(f"  CV                  : 5-fold (KFold embaralhado)")
+    print(f"\n[2/4] HalvingRandomSearchCV — MLPRegressor")
+    print(f"  Candidatos iniciais : 60")
+    print(f"  CV                  : 5-fold (KFold shuffle, random_state={SEED})")
     print(f"  Early stopping      : ativo no CV (n_iter_no_change=20)")
-    print(f"  Target CV           : log(1+y)  |  Score: MAPE escala original\n")
+    print(f"  Target              : log1p(y)  |  Score: MAPE escala original\n")
 
-    cv  = KFold(n_splits=5, shuffle=True, random_state=SEED)
-
-    # early_stopping=True: para automaticamente quando a loss de validação
-    # não melhora — reduz ~3-4x o tempo por fold sem perder qualidade
+    cv = KFold(n_splits=5, shuffle=True, random_state=SEED)
     mlp = MLPRegressor(
         early_stopping=True,
         validation_fraction=0.1,
@@ -133,27 +139,30 @@ def rodar_grid_search(X_cv, y_cv):
     hs = HalvingRandomSearchCV(
         estimator=mlp,
         param_distributions=PARAM_DIST,
-        n_candidates=60,          # candidatos na 1ª rodada
-        factor=3,                 # a cada rodada mantém 1/3 dos melhores
+        n_candidates=60,
+        factor=3,
         scoring=mape_scorer,
         cv=cv,
         n_jobs=-1,
         verbose=1,
         refit=False,
         random_state=SEED,
-        min_resources="exhaust",  # usa todos os dados na rodada final
+        min_resources="exhaust",
     )
+
+    _t0 = time.perf_counter()
     hs.fit(X_cv, y_cv)
+    tempo_gs = round(time.perf_counter() - _t0, 2)
 
     res = pd.DataFrame(hs.cv_results_)
     res = res.sort_values("mean_test_score", ascending=False).reset_index(drop=True)
-    res["mape_cv"]     = -res["mean_test_score"]
-    res["mape_cv_std"] =  res["std_test_score"]
+    res["mape_cv"] = -res["mean_test_score"]
+    res["mape_cv_std"] = res["std_test_score"]
 
     melhores_params = hs.best_params_.copy()
-    melhor_mape_cv  = -hs.best_score_
+    melhor_mape_cv = -hs.best_score_
 
-    # Remove params exclusivos do CV (treino final não usa validação interna)
+    # Remove params exclusivos do CV
     for k in ("early_stopping", "validation_fraction"):
         melhores_params.pop(k, None)
 
@@ -162,87 +171,149 @@ def rodar_grid_search(X_cv, y_cv):
     print(f"  Ativação        : {melhores_params['activation']}")
     print(f"  Alpha           : {melhores_params['alpha']:.5f}")
     print(f"  LR init         : {melhores_params['learning_rate_init']:.5f}")
+    print(f"  Tempo busca     : {tempo_gs}s")
 
-    return melhores_params, melhor_mape_cv, res
+    return melhores_params, melhor_mape_cv, res, tempo_gs
 
-# ══════════════════════════════════════════════════════════════════════════════
+
 # TREINO FINAL + AVALIAÇÃO
-#
-# Fluxo do target log:
-#   treina em log(1+y)  →  prediz em log  →  expm1(pred) = contagem estimada
-#   avalia MAPE(y_test_original, expm1(pred))
-#
-# No treino final: max_iter maior (2000) e sem early_stopping — usa todos os
-# dados de augmentação sem reservar fração de validação.
-# ══════════════════════════════════════════════════════════════════════════════
 
-def treinar_e_avaliar(melhores_params, X_full, y_full, X_test, y_test):
+def treinar_e_avaliar(melhores_params, X_full, y_full_log, y_full_orig,
+                      X_test, y_test):
     print("\n[3/4] Treinando modelo final (max_iter=2000, sem early_stopping)...")
 
     params_final = {
         **melhores_params,
-        "max_iter"        : 2000,
+        "max_iter": 2000,
         "n_iter_no_change": 50,
-        "early_stopping"  : False,   # treina em todos os dados, sem val. interna
+        "early_stopping": False,
     }
     modelo = MLPRegressor(**params_final)
-    modelo.fit(X_full, y_full)
 
-    # Converte predição de volta para escala original
+    _t0 = time.perf_counter()
+    modelo.fit(X_full, y_full_log)
+    tempo_treino = round(time.perf_counter() - _t0, 2)
+    print(f"  Tempo treino final: {tempo_treino}s")
+
+    # ── Predição no teste ─────────────────────────────────────────────────────
     y_pred_log = modelo.predict(X_test)
-    y_pred     = np.expm1(y_pred_log)
-    y_pred     = np.maximum(y_pred, 0.0)
-    y_pred_arr = np.round(y_pred)
+    y_pred = np.clip(np.expm1(y_pred_log), 0.0, None)
+    y_pred_int = np.round(y_pred).astype(int)
 
-    mape_v = mape_original_scale(np.log1p(y_test), y_pred_log)
-    mae_v  = mean_absolute_error(y_test, y_pred)
-    rmse_v = np.sqrt(mean_squared_error(y_test, y_pred))
-    r2_v   = r2_score(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
 
-    print(f"\n  ══ Resultado no conjunto de teste ═══════════")
-    print(f"  MAPE  : {mape_v:.2f}%    ← métrica principal")
-    print(f"  MAE   : {mae_v:.4f}  laranjas")
-    print(f"  RMSE  : {rmse_v:.4f}  laranjas")
-    print(f"  R²    : {r2_v:.4f}")
-    print(f"  ═════════════════════════════════════════════")
+    # corrigido: MAPE consistente com XGBoost e SVR (mask y>0)
+    mask = y_test > 0
+    mape = float(np.mean(np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])) * 100)
+    mdape = float(np.median(np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])) * 100)
 
-    metricas = {"mape": mape_v, "mae": mae_v, "rmse": rmse_v, "r2": r2_v}
-    return modelo, y_pred, y_pred_arr, metricas
+    dentro_1 = float(np.mean(np.abs(y_test - y_pred_int) <= 1) * 100)
+    dentro_2 = float(np.mean(np.abs(y_test - y_pred_int) <= 2) * 100)
+    dentro_20 = float(np.mean(np.abs((y_test - y_pred) / (y_test + 1e-6)) <= 0.20) * 100)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# DIAGNÓSTICO POR FAIXA DE CONTAGEM
-# ══════════════════════════════════════════════════════════════════════════════
+    # ── Predição no treino (gap) ──────────────────────────────────────────────
+    y_pred_tr_log = modelo.predict(X_full)
+    y_pred_tr = np.clip(np.expm1(y_pred_tr_log), 0.0, None)
+
+    mae_tr = mean_absolute_error(y_full_orig, y_pred_tr)
+    rmse_tr = np.sqrt(mean_squared_error(y_full_orig, y_pred_tr))
+    r2_tr = r2_score(y_full_orig, y_pred_tr)
+    mask_tr = y_full_orig > 0
+    mape_tr = float(np.mean(np.abs(
+        (y_full_orig[mask_tr] - y_pred_tr[mask_tr]) / y_full_orig[mask_tr]
+    )) * 100)
+
+    print(f"\n  {'Métrica':<20} {'Treino':>10} {'Teste':>10}")
+    print(f"  {'─' * 42}")
+    print(f"  {'MAE':<20} {mae_tr:>10.3f} {mae:>10.3f}")
+    print(f"  {'RMSE':<20} {rmse_tr:>10.3f} {rmse:>10.3f}")
+    print(f"  {'R²':<20} {r2_tr:>10.4f} {r2:>10.4f}")
+    print(f"  {'MAPE':<20} {mape_tr:>9.1f}% {mape:>9.1f}%")
+    print(f"  {'─' * 42}")
+    print(f"  MdAPE (teste):      {mdape:.1f}%")
+    print(f"  ±1 fruta:           {dentro_1:.1f}%")
+    print(f"  ±2 frutas:          {dentro_2:.1f}%")
+    print(f"  Dentro de 20%:      {dentro_20:.1f}%")
+
+    metricas = {
+        "treino": {
+            "MAE": round(mae_tr, 4), "RMSE": round(rmse_tr, 4),
+            "R2": round(r2_tr, 4), "MAPE": round(mape_tr, 2),
+        },
+        "teste": {
+            "MAE": round(mae, 4),
+            "RMSE": round(rmse, 4),
+            "R2": round(r2, 4),
+            "MAPE": round(mape, 2),
+            "MdAPE": round(mdape, 2),
+            "gap_MAPE_MdAPE": round(mape - mdape, 2),
+            "acerto_pm1": round(dentro_1, 1),
+            "acerto_pm2": round(dentro_2, 1),
+            "dentro_20pct": round(dentro_20, 1),
+        },
+        "gap_treino_teste": {
+            "MAE_ratio": round(mae / (mae_tr + 1e-9), 2),
+            "MAPE_delta": round(mape - mape_tr, 2),
+            "R2_delta": round(r2 - r2_tr, 4),
+        },
+    }
+    return modelo, y_pred, y_pred_int, metricas, tempo_treino
+
+
+# DIAGNÓSTICO POR FAIXA
 
 def diagnostico_por_faixa(y_test, y_pred):
-    """Imprime MAPE médio por faixa de contagem real."""
-    df = pd.DataFrame({"real": y_test, "pred": y_pred})
-    df["faixa"] = pd.cut(df["real"], bins=[0, 1, 2, 3, 5, 9, 99],
-                         labels=["=1", "=2", "=3", "4–5", "6–9", "≥10"])
-    print("\n  ══ MAPE por faixa de contagem ═══════════════")
-    for faixa, grp in df.groupby("faixa", observed=True):
-        mape_f = np.mean(np.abs(grp["real"] - grp["pred"]) /
-                         np.maximum(grp["real"], 1.0)) * 100
-        vies   = grp["pred"].mean() - grp["real"].mean()
-        sinal  = "↑" if vies > 0.1 else ("↓" if vies < -0.1 else "≈")
-        print(f"  Contagem {faixa:>4} : n={len(grp):>3}  "
-              f"MAPE={mape_f:>6.1f}%  "
-              f"viés={vies:>+.2f} {sinal}")
-    print("  ═════════════════════════════════════════════")
+    """
+    corrigido: faixas consistentes com XGBoost e SVR
+    (0, 1, 2, 3-4, 5-7, 8+) e métricas com mask y>0.
+    Retorna lista para incluir no JSON.
+    """
+    print("\n  MAPE por faixa de contagem:")
+    print(f"  {'Faixa':<8} {'N':>5} {'MAE':>6} {'MAPE%':>7} {'±1':>7} {'Bias':>7}")
+    print(f"  {'─' * 42}")
 
-# ══════════════════════════════════════════════════════════════════════════════
+    faixas_def = [(0, 0), (1, 1), (2, 2), (3, 4), (5, 7), (8, 999)]
+    faixas_label = ["0", "1", "2", "3-4", "5-7", "8+"]
+    metricas_f = []
+
+    for (lo, hi), label in zip(faixas_def, faixas_label):
+        idx = (y_test >= lo) & (y_test <= hi)
+        n = idx.sum()
+        if n == 0:
+            continue
+        yt, yp = y_test[idx], y_pred[idx]
+        mae_f = float(np.mean(np.abs(yt - yp)))
+        mf = yt > 0
+        mape_f = float(np.mean(np.abs((yt[mf] - yp[mf]) / yt[mf])) * 100) if mf.sum() > 0 else 0.0
+        a1 = float(np.mean(np.abs(yt - np.round(yp)) <= 1) * 100)
+        bias = float(np.mean(yp - yt))
+        flag = " ← PROBLEMA" if mape_f > 60 else ""
+        print(f"  {label:<8} {int(n):>5} {mae_f:>6.2f} {mape_f:>6.1f}%  {a1:>5.1f}%  {bias:>+6.2f}{flag}")
+        metricas_f.append({
+            "faixa": label, "n": int(n),
+            "mae": round(mae_f, 3),
+            "mape": round(mape_f, 1),
+            "acerto_pm1": round(a1, 1),
+            "bias": round(bias, 3),
+        })
+
+    return metricas_f
+
+
 # RELATÓRIO POR IMAGEM
-# ══════════════════════════════════════════════════════════════════════════════
 
-def gerar_relatorio_imagens(y_test, y_pred, y_pred_arr, nomes_test, ids_test):
+def gerar_relatorio_imagens(y_test, y_pred, y_pred_int, nomes_test, ids_test):
     n = len(y_test)
     df = pd.DataFrame({
-        "image_id"        : ids_test   if ids_test   is not None else range(n),
-        "file_name"       : nomes_test if nomes_test is not None else [f"img_{i}" for i in range(n)],
-        "contagem_real"   : y_test.astype(int),
-        "pred_continua"   : np.round(y_pred, 2),
-        "pred_arredondada": y_pred_arr.astype(int),
-        "erro_abs"        : np.abs(y_test - y_pred_arr).astype(int),
-        "erro_perc"       : np.round(
+        "image_id": ids_test if ids_test is not None else range(n),
+        "file_name": nomes_test if nomes_test is not None else [f"img_{i}" for i in range(n)],
+        "contagem_real": y_test.astype(int),
+        "pred_continua": np.round(y_pred, 2),
+        "pred_arredondada": y_pred_int.astype(int),
+        "erro_abs": np.abs(y_test - y_pred_int).astype(int),
+        "erro_perc": np.round(
             np.abs(y_test - y_pred) / np.maximum(np.abs(y_test), 1.0) * 100, 2
         ),
     })
@@ -250,7 +321,7 @@ def gerar_relatorio_imagens(y_test, y_pred, y_pred_arr, nomes_test, ids_test):
 
 
 def imprimir_amostras(df_pred, n=15):
-    print(f"\n  ══ Top {n} maiores erros ═════════════════════════════════════")
+    print(f"\n  Top {n} maiores erros:")
     print(f"  {'Arquivo':<35} {'Real':>6} {'Pred':>6} {'ErrAbs':>7} {'Err%':>7}")
     print("  " + "─" * 65)
     for _, row in df_pred.head(n).iterrows():
@@ -259,96 +330,225 @@ def imprimir_amostras(df_pred, n=15):
               f"{int(row['pred_arredondada']):>6} "
               f"{int(row['erro_abs']):>7} "
               f"{row['erro_perc']:>6.1f}%")
-    print("  " + "═" * 65)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TABELA TOP-10 PARA O TCC
-# ══════════════════════════════════════════════════════════════════════════════
 
 def imprimir_tabela_tcc(res_grid, n=10):
     top = res_grid.head(n)
-    print(f"\n  ══ Top-{n} arquiteturas — TCC ══════════════════════════════════")
-    print(f"  {'#':<3} {'Arquitetura':<28} {'Ativ.':<6} {'Alpha':<8} "
-          f"{'LR':<7} {'MAPE CV':>9} {'±std':>7}")
-    print("  " + "─" * 72)
+    print(f"\n  Top-{n} arquiteturas:")
+    print(f"  {'#':<3} {'Arquitetura':<28} {'Ativ.':<6} {'Alpha':<10} "
+          f"{'LR':<10} {'MAPE CV':>9} {'±std':>8}")
+    print("  " + "─" * 78)
     for i, (_, row) in enumerate(top.iterrows()):
-        print(f"  {i+1:<3} {str(row['param_hidden_layer_sizes']):<28} "
+        alpha = row.get('param_alpha', 'n/d')
+        lr = row.get('param_learning_rate_init', 'n/d')
+        alpha_s = f"{float(alpha):.5f}" if isinstance(alpha, (int, float, np.floating)) else str(alpha)
+        lr_s = f"{float(lr):.5f}" if isinstance(lr, (int, float, np.floating)) else str(lr)
+        print(f"  {i + 1:<3} {str(row['param_hidden_layer_sizes']):<28} "
               f"{str(row['param_activation']):<6} "
-              f"{str(row['param_alpha']):<8} "
-              f"{str(row['param_learning_rate_init']):<7} "
-              f"{row['mape_cv']:>8.2f}%  "
-              f"±{row['mape_cv_std']:.2f}%")
-    print("  " + "═" * 72)
+              f"{alpha_s:<10} {lr_s:<10} "
+              f"{row['mape_cv']:>8.2f}%  ±{row['mape_cv_std']:.2f}%")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SALVAR
-# ══════════════════════════════════════════════════════════════════════════════
 
-def salvar(modelo, melhores_params, melhor_mape_cv,
-           metricas, res_grid, df_pred, feat_cols):
-    print("\n[4/4] Salvando resultados...")
+# SALVAR — JSON completo para reprodutibilidade IEEE
+
+def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
+           metricas, metricas_faixa, res_grid, df_pred, feat_cols,
+           n_treino_full, n_treino_orig, n_teste,
+           tempo_gs, tempo_treino):
+    print("\n[4/4] Salvando artefatos...")
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    joblib.dump(modelo, f"{OUTPUT_DIR}/mlp_v8_{ts}.joblib")
-    res_grid.to_csv(f"{OUTPUT_DIR}/grid_todas_arquiteturas_{ts}.csv", index=False)
-    df_pred.to_csv(f"{OUTPUT_DIR}/predicoes_por_imagem_{ts}.csv",     index=False)
+    # ── joblib + CSVs ─────────────────────────────────────────────────────────
+    joblib.dump(modelo, f"{OUTPUT_DIR}/mlp_v9_modelo.joblib")
+    res_grid.to_csv(f"{OUTPUT_DIR}/mlp_v9_grid_todas_arquiteturas.csv", index=False)
+    df_pred.to_csv(f"{OUTPUT_DIR}/mlp_v9_predicoes_por_imagem.csv", index=False)
 
-    resumo = pd.DataFrame([{
-        "timestamp"         : ts,
-        "dataset"           : "v8",
-        "target"            : "log(1+contagem)",
-        "n_features"        : len(feat_cols),
-        "melhor_arquitetura": str(melhores_params["hidden_layer_sizes"]),
-        "melhor_ativacao"   : melhores_params["activation"],
-        "melhor_alpha"      : melhores_params["alpha"],
-        "melhor_lr_init"    : melhores_params["learning_rate_init"],
-        "mape_cv_perc"      : round(melhor_mape_cv, 4),
-        "mape_teste_perc"   : round(metricas["mape"], 4),
-        "mae_teste"         : round(metricas["mae"], 4),
-        "rmse_teste"        : round(metricas["rmse"], 4),
-        "r2_teste"          : round(metricas["r2"], 4),
-    }])
-    resumo.to_csv(f"{OUTPUT_DIR}/resumo_{ts}.csv", index=False)
-    print(f"  Arquivos salvos em: {OUTPUT_DIR}/")
+    # ── Versões ───────────────────────────────────────────────────────────────
+    try:
+        versao_sklearn = importlib.metadata.version("scikit-learn")
+    except Exception:
+        import sklearn
+        versao_sklearn = sklearn.__version__
+    try:
+        versao_scipy = importlib.metadata.version("scipy")
+    except Exception:
+        import scipy
+        versao_scipy = scipy.__version__
 
-# ══════════════════════════════════════════════════════════════════════════════
+    # ── CV detalhado por fold (do melhor candidato) ───────────────────────────
+    cv_por_fold = []
+    if not res_grid.empty:
+        best_row = res_grid.iloc[0]
+        for fold in range(5):
+            chave = f"split{fold}_test_score"
+            if chave in best_row.index:
+                cv_por_fold.append({
+                    "fold": fold + 1,
+                    "mape_cv": round(float(-best_row[chave]), 4),
+                })
+
+    # ── Converter melhores_params para JSON-serializável ──────────────────────
+    melhores_params_serial = {}
+    for k, v in melhores_params.items():
+        if isinstance(v, tuple):
+            melhores_params_serial[k] = str(v)
+        elif isinstance(v, (np.floating, np.integer)):
+            melhores_params_serial[k] = float(v) if isinstance(v, np.floating) else int(v)
+        else:
+            melhores_params_serial[k] = v
+
+    # ── JSON ──────────────────────────────────────────────────────────────────
+    saida = {
+
+        # ── Protocolo ─────────────────────────────────────────────────────────
+        "protocolo": {
+            "dataset_treino": "orandet_v80_train_norm.csv (normalizado [0,1])",
+            "dataset_teste": "orandet_v80_test_norm.csv  (normalizado [0,1])",
+            "n_amostras_treino_total": int(n_treino_full),
+            "n_amostras_treino_originais": int(n_treino_orig),
+            "n_amostras_teste": int(n_teste),
+            "subset_busca": "Originais apenas (sem augmentadas) — evita leakage de CV",
+            "treino_final": "Originais + augmentadas",
+            "n_features": len(feat_cols),
+            "alvo_modelo": "contagem_log1p",
+            "transformacao_inversa": "np.expm1(pred) — converte log1p para escala original",
+            "avaliacao_escala": "contagem direta (inteiro) após expm1",
+            "normalizacao": "MinMaxScaler [0,1] ajustado no treino (orandet_v80_scaler.joblib)",
+            "conjunto_validacao_dedicado": (
+                "Implicito: durante o CV, early_stopping=True usa "
+                "validation_fraction=0.1 internamente em cada fold. "
+                "Treino final: early_stopping=False (usa todos os dados)."
+            ),
+        },
+
+        # ── Arquitetura ───────────────────────────────────────────────────────
+        "arquitetura": {
+            "tipo": "MLPRegressor (scikit-learn)",
+            "hidden_layer_sizes": str(melhores_params["hidden_layer_sizes"]),
+            "activation": melhores_params["activation"],
+            "solver": melhores_params["solver"],
+        },
+
+        # ── Hiperparâmetros finais ────────────────────────────────────────────
+        "hiperparametros_finais": {
+            **melhores_params_serial,
+            "max_iter_treino_final": 2000,
+            "n_iter_no_change_treino_final": 50,
+            "early_stopping_treino_final": False,
+            "max_iter_cv": 500,
+            "n_iter_no_change_cv": 20,
+            "early_stopping_cv": True,
+            "validation_fraction_cv": 0.1,
+        },
+
+        # ── Espaço de busca completo ──────────────────────────────────────────
+        "espaco_de_busca": PARAM_DIST_DOC,
+
+        # ── Busca de hiperparâmetros ──────────────────────────────────────────
+        "busca_hiperparametros": {
+            "metodo": "HalvingRandomSearchCV",
+            "n_candidatos_inicial": 60,
+            "factor": 3,
+            "min_resources": "exhaust",
+            "scoring": "neg_mape_escala_original (via make_scorer)",
+            "cv_folds": 5,
+            "kfold_shuffle": True,
+            "kfold_random_state": SEED,
+            "amostras_busca": "originais apenas",
+        },
+
+        # ── Validação cruzada — melhor candidato ──────────────────────────────
+        "validacao_cruzada": {
+            "n_folds": 5,
+            "random_state": SEED,
+            "mape_cv_mean": round(float(melhor_mape_cv), 4),
+            "mape_cv_std": round(float(mape_cv_std), 4) if mape_cv_std is not None else None,
+            "por_fold": cv_por_fold,
+            "nota": "MAPE calculado na escala original via expm1 dentro do scorer.",
+        },
+
+        # ── Resultados ────────────────────────────────────────────────────────
+        "resultados_treino": metricas["treino"],
+        "resultados_teste": metricas["teste"],
+        "gap_treino_teste": metricas["gap_treino_teste"],
+        "resultados_por_faixa": metricas_faixa,
+
+        # ── Eficiência ────────────────────────────────────────────────────────
+        "eficiencia": {
+            "tempo_grid_search_s": tempo_gs,
+            "tempo_treino_final_s": tempo_treino,
+            "versao_sklearn": versao_sklearn,
+            "versao_scipy": versao_scipy,
+        },
+
+        # ── Metadados de execução ─────────────────────────────────────────────
+        "timestamp": ts,
+    }
+
+    with open(f"{OUTPUT_DIR}/mlp_v9_relatorio.json", "w", encoding="utf-8") as f:
+        json.dump(saida, f, indent=2, ensure_ascii=False)
+
+    print(f"  Arquivos em: {OUTPUT_DIR}/")
+    print(f"    ├─ mlp_v9_modelo.joblib")
+    print(f"    ├─ mlp_v9_relatorio.json          ← protocolo + grade + métricas completas")
+    print(f"    ├─ mlp_v9_grid_todas_arquiteturas.csv")
+    print(f"    └─ mlp_v9_predicoes_por_imagem.csv")
+
+    return saida
+
+
 # MAIN
-# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     print("\n" + "═" * 65)
-    print("  MLP v8 — Contagem de Laranjas Verdes (OranDet/Embrapa)")
-    print("  Target: log(1+y) | Features: 162 focadas em contagem")
-    print("  Busca: HalvingRandomSearchCV (10-15x mais rápido que Grid)")
+    print("  MLP v9 — Contagem de Laranjas Verdes (OranDet v80)")
+    print("  Target: log1p(y)  |  Inversa: expm1")
+    print("  Busca: HalvingRandomSearchCV (60 candidatos, fator 3)")
     print("═" * 65)
 
     (X_cv, y_cv,
-     X_full, y_full,
+     X_full, y_full_log, y_full_orig,
      X_test, y_test,
-     feat_cols,
-     nomes_test, ids_test) = carregar_dados()
+     feat_cols, nomes_test, ids_test) = carregar_dados()
 
-    melhores_params, melhor_mape_cv, res_grid = rodar_grid_search(X_cv, y_cv)
+    melhores_params, melhor_mape_cv, res_grid, tempo_gs = rodar_grid_search(X_cv, y_cv)
+    mape_cv_std = res_grid.iloc[0]["mape_cv_std"] if not res_grid.empty else None
 
-    modelo, y_pred, y_pred_arr, metricas = treinar_e_avaliar(
-        melhores_params, X_full, y_full, X_test, y_test
+    modelo, y_pred, y_pred_int, metricas, tempo_treino = treinar_e_avaliar(
+        melhores_params, X_full, y_full_log, y_full_orig, X_test, y_test
     )
+
+    metricas_faixa = diagnostico_por_faixa(y_test, y_pred)
 
     df_pred = gerar_relatorio_imagens(
-        y_test, y_pred, y_pred_arr, nomes_test, ids_test
+        y_test, y_pred, y_pred_int, nomes_test, ids_test
     )
 
-    diagnostico_por_faixa(y_test, y_pred)
     imprimir_tabela_tcc(res_grid, n=10)
     imprimir_amostras(df_pred, n=15)
 
-    salvar(modelo, melhores_params, melhor_mape_cv,
-           metricas, res_grid, df_pred, feat_cols)
+    relatorio = salvar(
+        modelo, melhores_params, melhor_mape_cv, mape_cv_std,
+        metricas, metricas_faixa, res_grid, df_pred, feat_cols,
+        n_treino_full=len(X_full), n_treino_orig=len(X_cv), n_teste=len(X_test),
+        tempo_gs=tempo_gs, tempo_treino=tempo_treino,
+    )
 
     print(f"\n{'═' * 65}")
-    print(f"  MAPE teste final : {metricas['mape']:.2f}%")
-    print(f"  Arquitetura      : {melhores_params['hidden_layer_sizes']}")
-    print(f"  Ativação         : {melhores_params['activation']}")
+    print(f"  Arquitetura       : {melhores_params['hidden_layer_sizes']}")
+    print(f"  Ativação          : {melhores_params['activation']}")
+    print(f"  MAPE CV           : {melhor_mape_cv:.2f}%")
+    print(f"  MAE teste         : {metricas['teste']['MAE']:.3f}")
+    print(f"  RMSE teste        : {metricas['teste']['RMSE']:.3f}")
+    print(f"  R² teste          : {metricas['teste']['R2']:.4f}")
+    print(f"  MAPE teste        : {metricas['teste']['MAPE']:.1f}%")
+    print(f"  MdAPE teste       : {metricas['teste']['MdAPE']:.1f}%")
+    print(f"  ±1 fruta          : {metricas['teste']['acerto_pm1']:.1f}%")
+    print(f"  ±2 frutas         : {metricas['teste']['acerto_pm2']:.1f}%")
+    print(f"  Gap MAE ratio     : {metricas['gap_treino_teste']['MAE_ratio']:.2f}x")
+    print(f"  Tempo busca       : {tempo_gs}s")
+    print(f"  Tempo treino final: {tempo_treino}s")
     print(f"{'═' * 65}\n")
 
 
