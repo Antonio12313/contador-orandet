@@ -6,6 +6,20 @@ REFERÊNCIAS PRINCIPAIS:
   Okamoto & Lee (2009)      — Chromaticidade Cr-Cb para citrus verde
   Hu (2018)                 — LBP + MSER + Hough hierárquico para citrus verde
   Frangi et al. (1998)      — Hessiana multiscale blob enhancement
+
+CORREÇÕES desta versão (v8.1):
+  [BUG] features_geometria: cv2.MSER_create(_delta=...) lançava TypeError no
+        OpenCV 4.x e o try/except zerava tudo (MSER sempre = 0). Corrigido
+        para usar setters — G10 e cnt_mser_* agora funcionam.
+  [BUG] features derivadas usavam f["mascara_prop_fruta"] / f["mascara_n_blobs"]
+        que nunca eram criadas → KeyError em toda imagem. Agora essas features
+        de máscara são calculadas (e populam o grupo G_mascara).
+  [LIMPEZA] Removidas augmentação comentada e helpers não usados (treino é só
+        nas 2759 originais).
+  [META] gerar_info: normalização corrigida para z-score (StandardScaler não
+        produz [0,1]); augmentação marcada como não aplicada.
+  [MELHORIA] máscara passada às features de cor (HSV/RGB/LAB); guarda anti
+        região-plana na isotropia de Gabor; V_eq reaproveitado na contagem.
 """
 
 import os
@@ -22,7 +36,7 @@ from skimage.feature import hog, local_binary_pattern
 from skimage.feature import graycomatrix, graycoprops
 from scipy.stats import skew, kurtosis
 from scipy import ndimage
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 import time
 from ambiente import coletar_ambiente
 
@@ -31,7 +45,7 @@ warnings.filterwarnings("ignore")
 # CONFIGURAÇÃO
 
 DATA_DIR = "/Users/antonioreis/Downloads/dataverse_files"
-OUTPUT_DIR = "./dataset_preparado_v80"
+OUTPUT_DIR = "./dataset_preparado_v11"
 IMG_SIZE = 416
 
 COLUNAS_META = [
@@ -42,15 +56,6 @@ COLUNAS_META = [
 # Thresholds para limpeza de features
 VAR_THRESHOLD = 1e-5
 CORR_THRESHOLD = 0.97
-
-# Tipos de augmentação aplicados (usado no JSON de metadados)
-TIPOS_AUGMENTACAO = [
-    "rot180",
-    "color_jitter",
-    "gamma_low",
-    "gauss_blur",
-    "oclusao",
-]
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -67,16 +72,15 @@ def _safe_kurtosis(arr):
     return float(val) if np.isfinite(val) else 0.0
 
 
+_SUFIXOS_FO = ["mean", "std", "median", "entropy", "p10", "p90", "iqr",
+               "skewness", "kurtosis", "energy", "uniformity", "mad"]
+
+
 def _first_order(canal, prefixo):
     """12 estatísticas de primeira ordem compactas."""
     c = np.array(canal, dtype=np.float64).flatten()
-    sufixos = [
-        "mean", "std", "median", "entropy",
-        "p10", "p90", "iqr",
-        "skewness", "kurtosis", "energy", "uniformity", "mad",
-    ]
     if len(c) == 0:
-        return {f"{prefixo}_{s}": 0.0 for s in sufixos}
+        return {f"{prefixo}_{s}": 0.0 for s in _SUFIXOS_FO}
 
     norm = 255.0
     hist, _ = np.histogram(c, bins=256, range=(0, 256), density=False)
@@ -106,17 +110,31 @@ def _first_order_mascara(canal, mascara, prefixo):
     """Aplica first_order apenas nos pixels dentro da máscara."""
     px = canal[mascara > 0]
     if len(px) == 0:
-        return {f"{prefixo}_{s}": 0.0 for s in [
-            "mean", "std", "median", "entropy", "p10", "p90", "iqr",
-            "skewness", "kurtosis", "energy", "uniformity", "mad",
-        ]}
+        return {f"{prefixo}_{s}": 0.0 for s in _SUFIXOS_FO}
     return _first_order(px, prefixo)
+
+
+def _stats_mascarado(canal, mascara, prefixo):
+    """Calcula _first_order só sobre os pixels da fruta.
+    Faz fallback para a imagem inteira se a máscara for vazia/minúscula."""
+    if mascara is not None:
+        vals = canal[mascara > 0]
+        if vals.size < 50:
+            vals = canal.reshape(-1)
+    else:
+        vals = canal.reshape(-1)
+    return _first_order(vals.reshape(-1, 1), prefixo)
 
 
 # MAPAS AUXILIARES
 
 def _gabor_isotropy_map(gray):
-    """Isotropia Gabor: fruta esférica = resposta uniforme em todas orientações."""
+    """Isotropia Gabor: fruta esférica = resposta uniforme em todas orientações.
+
+    Guarda anti região-plana: onde NÃO há resposta de Gabor (fundo liso sem
+    textura), a isotropia é zerada — evita marcar fundo plano como 'esférico',
+    que era um falso sinal das versões anteriores.
+    """
     orientacoes = [0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
     respostas = []
     for theta in orientacoes:
@@ -128,9 +146,11 @@ def _gabor_isotropy_map(gray):
         respostas.append(resp)
 
     stacked = np.stack(respostas, axis=0)
-    mean_resp = stacked.mean(axis=0) + 1e-9
+    mean_resp = stacked.mean(axis=0)
     std_resp = stacked.std(axis=0)
-    isotropy = 1.0 - np.clip(std_resp / mean_resp, 0, 1)
+    isotropy = 1.0 - np.clip(std_resp / (mean_resp + 1e-9), 0, 1)
+    piso = 0.15 * (mean_resp.mean() + 1e-9)        # piso de resposta relativo
+    isotropy[mean_resp < piso] = 0.0
     return isotropy.astype(np.float32)
 
 
@@ -186,43 +206,34 @@ def construir_mascara_fruta_verde(img_bgr):
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
 
-    # --- Critério A: Gabor Isotropy (Kurtulmus 2011) ---
     iso_map = _gabor_isotropy_map(gray)
     crit_A = (iso_map >= float(np.percentile(iso_map, 55))).astype(np.float32)
 
-    # --- Critério B: SATD liso (Zhao & Lee 2016) ---
     satd_map_v = _satd_map(gray)
     crit_B = (satd_map_v <= float(np.percentile(satd_map_v, 50))).astype(np.float32)
 
-    # --- Critério C: Laplaciano baixo (sem nervuras) ---
     lap_map = _laplacian_smooth_map(gray)
     crit_C = (lap_map <= float(np.percentile(lap_map, 55))).astype(np.float32)
 
-    # --- Critério D: LAB b* (carotenoides) ---
     b_ch = lab[:, :, 2].astype(np.float32)
     crit_D = (b_ch >= float(np.percentile(b_ch, 50))).astype(np.float32)
 
-    # --- Critério E: Hessiana blob-ness (Frangi 1998) — NOVO v7.1 ---
     hess_map = _hessian_convexity_map(gray)
     crit_E = (hess_map >= float(np.percentile(hess_map, 60))).astype(np.float32)
 
-    # --- Critério F: Cr-Cb discrimination (Okamoto & Lee 2009) — NOVO v7.1 ---
     Cr = ycrcb[:, :, 1].astype(np.float32)
     Cb = ycrcb[:, :, 2].astype(np.float32)
     crcb_diff = Cr - Cb
     crit_F = (crcb_diff >= float(np.percentile(crcb_diff, 45))).astype(np.float32)
 
-    # --- Votação 2/6 (mais permissiva que 3/5) ---
     voto = crit_A + crit_B + crit_C + crit_D + crit_E + crit_F
     mask_raw = (voto >= 2).astype(np.uint8) * 255
 
-    # --- Morfologia suavizada ---
     k3 = np.ones((3, 3), np.uint8)
     k5 = np.ones((5, 5), np.uint8)
     mascara = cv2.morphologyEx(mask_raw, cv2.MORPH_OPEN, k3, iterations=1)
     mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, k5, iterations=2)
 
-    # --- Filtro por circularidade + solidity (mais rigoroso) ---
     cnts, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mascara_filtrada = np.zeros_like(mascara)
     for cnt in cnts:
@@ -239,7 +250,6 @@ def construir_mascara_fruta_verde(img_bgr):
 
     prop = float(mascara_filtrada.sum()) / (255.0 * h * w)
 
-    # --- FALLBACK: máscara muito pequena → usa apenas A+F (mais robustos) ---
     if prop < 0.005:
         fallback_mask = ((crit_A + crit_F) >= 1).astype(np.uint8) * 255
         fallback_mask = cv2.morphologyEx(fallback_mask, cv2.MORPH_CLOSE, k5, iterations=2)
@@ -258,7 +268,6 @@ def construir_mascara_fruta_verde(img_bgr):
             mascara_filtrada = mascara_fb
             prop = prop_fb
 
-    # --- Proteção final ---
     if prop < 0.002 or prop > 0.45:
         mascara_filtrada = np.zeros_like(mascara_filtrada)
 
@@ -266,42 +275,56 @@ def construir_mascara_fruta_verde(img_bgr):
 
 
 # G1 — HSV
-def features_hsv(img_bgr, hsv):
+def features_hsv(img_bgr, hsv, mascara=None):
     feats = {}
-    for i, nome in enumerate(["H", "S", "V"]):
-        hist = cv2.calcHist([hsv], [i], None, [16], [0, 256]).flatten()
+    cfg = [("H", 0, 180, 12), ("S", 0, 256, 8), ("V", 0, 256, 6)]
+    usar_mask = mascara is not None and cv2.countNonZero(mascara) >= 50
+    mask8 = mascara if usar_mask else None
+
+    for i, (nome, lo, hi, nb) in enumerate(cfg):
+        hist = cv2.calcHist([hsv], [i], mask8, [nb], [lo, hi]).flatten()
         hist = hist / (hist.sum() + 1e-7)
         for b, val in enumerate(hist):
             feats[f"hsv_hist_{nome}_b{b:02d}"] = float(val)
-        feats.update(_first_order(hsv[:, :, i], f"hsv_{nome}"))
+        feats.update(_stats_mascarado(hsv[:, :, i], mascara, f"hsv_{nome}"))
     return feats
 
 
 # G2 — RGB + LAB + YCbCr
-def features_rgb_lab(img_bgr):
+def features_rgb_lab(img_bgr, mascara=None):
     feats = {}
-    for nome, idx in {"R": 2, "G": 1, "B": 0}.items():
-        feats.update(_first_order(img_bgr[:, :, idx], f"rgb_{nome}"))
+    m = (mascara > 0) if mascara is not None else None
+    if m is not None and m.sum() < 50:
+        m = None
 
-    R = img_bgr[:, :, 2].astype(np.float64) + 1e-7
-    G = img_bgr[:, :, 1].astype(np.float64) + 1e-7
-    B = img_bgr[:, :, 0].astype(np.float64) + 1e-7
+    def _vals(canal_f):
+        return canal_f[m] if m is not None else canal_f.reshape(-1)
+
+    for nome, idx in {"R": 2, "G": 1, "B": 0}.items():
+        feats.update(_stats_mascarado(img_bgr[:, :, idx], mascara, f"rgb_{nome}"))
+
+    R = _vals(img_bgr[:, :, 2].astype(np.float64)) + 1e-7
+    G = _vals(img_bgr[:, :, 1].astype(np.float64)) + 1e-7
+    B = _vals(img_bgr[:, :, 0].astype(np.float64)) + 1e-7
     feats["rgb_razao_RG"] = float((R / G).mean())
     feats["rgb_razao_RB"] = float((R / B).mean())
     feats["rgb_razao_GB"] = float((G / B).mean())
-    feats["rgb_ExG"] = float(((2 * G - R - B) / (R + G + B + 1e-7)).mean())
+    soma = R + G + B
+    feats["rgb_ExG"] = float(((2 * G - R - B) / soma).mean())
+    feats["rgb_g_norm_mean"] = float((G / soma).mean())
+    feats["rgb_g_norm_std"] = float((G / soma).std())
+    feats["rgb_r_norm_mean"] = float((R / soma).mean())
 
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     for nome, idx in {"L": 0, "a": 1, "b": 2}.items():
-        feats.update(_first_order(lab[:, :, idx], f"lab_{nome}"))
-    a_ch = lab[:, :, 1].astype(np.float64) + 1e-7
-    b_ch = lab[:, :, 2].astype(np.float64) + 1e-7
+        feats.update(_stats_mascarado(lab[:, :, idx], mascara, f"lab_{nome}"))
+    a_ch = _vals(lab[:, :, 1].astype(np.float64)) + 1e-7
+    b_ch = _vals(lab[:, :, 2].astype(np.float64)) + 1e-7
     feats["lab_razao_a_b"] = float((a_ch / b_ch).mean())
 
     ycbcr = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
     for nome, idx in {"Y": 0, "Cr": 1, "Cb": 2}.items():
-        feats.update(_first_order(ycbcr[:, :, idx], f"ycbcr_{nome}"))
-
+        feats.update(_stats_mascarado(ycbcr[:, :, idx], mascara, f"ycbcr_{nome}"))
     return feats
 
 
@@ -455,7 +478,6 @@ def features_lbp(gray):
 
 
 # G7 — GLCM Haralick
-
 def features_glcm(gray):
     feats = {}
     gray_q = (gray // 4).astype(np.uint8)
@@ -478,8 +500,7 @@ def features_glcm(gray):
     return feats
 
 
-# G8 — SATD  [C1] CORRIGIDO: agora chamado em _extrair_de_img
-
+# G8 — SATD
 def features_satd(gray, mascara):
     feats = {}
     satd_map = _satd_map(gray)
@@ -506,7 +527,6 @@ def features_satd(gray, mascara):
 
 
 # G9 — HOG
-
 def features_hog(gray):
     feats = {}
     img_hog = cv2.resize(gray, (128, 128))
@@ -532,8 +552,7 @@ def features_hog(gray):
     return feats
 
 
-# G10 — Geometria de contornos + MSER  [C2] CORRIGIDO: agora chamado em _extrair_de_img
-
+# G10 — Geometria de contornos + MSER
 def features_geometria(img_bgr, mascara):
     feats = {}
     k3 = np.ones((3, 3), np.uint8)
@@ -569,13 +588,15 @@ def features_geometria(img_bgr, mascara):
     feats["geom_prop_blobs_circulares"] = float(n_circ / (len(circularities) + 1e-6))
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    n_total, n_circ_mser = 0, 0
     try:
-        mser = cv2.MSER_create(
-            _delta=8, _min_area=400, _max_area=25000,
-            _max_variation=0.12, _min_diversity=0.20,
-        )
+        # [BUG CORRIGIDO] No OpenCV 4.x os kwargs _delta/_min_area não existem;
+        # usar setters. Antes, o try/except mascarava o erro e zerava o MSER.
+        mser = cv2.MSER_create()
+        mser.setDelta(8)
+        mser.setMinArea(400)
+        mser.setMaxArea(25000)
         regs, _ = mser.detectRegions(gray)
-        n_total, n_circ_mser = 0, 0
         for pts in regs:
             if len(pts) < 400:
                 continue
@@ -588,18 +609,18 @@ def features_geometria(img_bgr, mascara):
                     _, (ma, mi), _ = ell
                     if mi > 0 and (ma / mi) < 1.5:
                         n_circ_mser += 1
-    except Exception:
+    except Exception as e:
+        print(f"  [aviso MSER] {type(e).__name__}: {e}")
         n_total = n_circ_mser = 0
 
     feats["geom_mser_total"] = float(n_total)
-    feats["geom_mser_circular"] = float(n_circ_mser)  # [C2] agora alimenta o ensemble corretamente
+    feats["geom_mser_circular"] = float(n_circ_mser)
     feats["geom_log_mser"] = float(np.log1p(n_circ_mser))
 
     return feats
 
 
 # G11 — Hough Circles
-
 def features_hough_circles(img_bgr, mascara):
     feats = {}
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -704,7 +725,6 @@ def features_hough_circles(img_bgr, mascara):
 
 
 # G12 — Grade espacial
-
 def features_grade_espacial(hsv, mascara, grid=(4, 4)):
     feats = {}
     V = hsv[:, :, 2].astype(np.float64)
@@ -736,7 +756,6 @@ def features_grade_espacial(hsv, mascara, grid=(4, 4)):
 
 
 # G13 — Multi-escala
-
 def features_multiescala(img_bgr):
     feats = {}
     escalas_data = {}
@@ -828,7 +847,6 @@ def features_multiescala(img_bgr):
 
 
 # G14 — Contagem Direta v7.1
-
 def _watershed_count(gray, mascara):
     if mascara.sum() == 0:
         return 0
@@ -859,7 +877,8 @@ def _watershed_count(gray, mascara):
     return sum(1 for i in range(1, n_labels) if stats[i, cv2.CC_STAT_AREA] >= area_min)
 
 
-def features_contagem_direta(img_bgr, mascara, n_hough_total, n_hough_mascara, n_mser_circular):
+def features_contagem_direta(img_bgr, mascara, n_hough_total, n_hough_mascara,
+                             n_mser_circular, V_eq=None):
     feats = {}
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
@@ -915,9 +934,10 @@ def features_contagem_direta(img_bgr, mascara, n_hough_total, n_hough_mascara, n
     feats["cnt_area_iso_prop"] = area_iso_alta
     feats["cnt_area_iso_rmedio"] = r_medio
 
-    V_uint8 = V.astype(np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    V_eq = clahe.apply(V_uint8)
+    # reaproveita V_eq já calculado (evita CLAHE redundante); senão calcula
+    if V_eq is None:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        V_eq = clahe.apply(V.astype(np.uint8))
     bas = _bas_relief_map(V_eq)
 
     ratio_map = np.zeros_like(V, dtype=np.float32)
@@ -1023,7 +1043,7 @@ def features_curvatura_hessiana(gray, mascara):
     return feats
 
 
-# G16 — Chromaticidade Cr-Cb  [C3] CORRIGIDO: agora chamado em _extrair_de_img
+# G16 — Chromaticidade Cr-Cb
 def features_chromaticidade_crcb(img_bgr, mascara):
     feats = {}
     ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
@@ -1091,7 +1111,7 @@ def features_chromaticidade_crcb(img_bgr, mascara):
     return feats
 
 
-# Pipeline completo por imagem  [C4] CORRIGIDO: ordem e chamadas completas
+# Pipeline completo por imagem
 def _extrair_de_img(img_bgr):
     img_bgr = cv2.resize(img_bgr, (IMG_SIZE, IMG_SIZE))
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
@@ -1100,61 +1120,36 @@ def _extrair_de_img(img_bgr):
 
     f = {}
 
-    # G9 — HOG
-    f.update(features_hog(gray))
+    f.update(features_hog(gray))                              # G9
+    f.update(features_multiescala(img_bgr))                   # G13
+    f.update(features_lbp(gray))                              # G6
+    f.update(features_glcm(gray))                             # G7
+    f.update(features_gabor(gray))                            # G5
+    f.update(features_curvatura_hessiana(gray, mascara))      # G15
 
-    # G13 — Multi-escala
-    f.update(features_multiescala(img_bgr))
-
-    # G6 — LBP
-    f.update(features_lbp(gray))
-
-    # G7 — GLCM
-    f.update(features_glcm(gray))
-
-    # G5 — Gabor
-    f.update(features_gabor(gray))
-
-    # G15 — Hessiana
-    f.update(features_curvatura_hessiana(gray, mascara))
-
-    # G11 — Hough
-    feats_hough = features_hough_circles(img_bgr, mascara)
+    feats_hough = features_hough_circles(img_bgr, mascara)    # G11
     f.update(feats_hough)
     n_hough_total = int(feats_hough.get("hough_total_estimado", 0))
     n_hough_mascara = int(feats_hough.get("hough_mascara_count", 0))
 
-    # G1 — HSV
-    f.update(features_hsv(img_bgr, hsv))
+    f.update(features_hsv(img_bgr, hsv, mascara))             # G1 (com máscara)
+    f.update(features_rgb_lab(img_bgr, mascara))              # G2 (com máscara)
 
-    # G2 — RGB + LAB + YCbCr
-    f.update(features_rgb_lab(img_bgr))
-
-    # G3 — Canal V equalizado
-    feats_v, V_eq = features_canal_v_eq(hsv, mascara)
+    feats_v, V_eq = features_canal_v_eq(hsv, mascara)         # G3
     f.update(feats_v)
+    f.update(features_basrelief(V_eq, mascara))               # G4
+    f.update(features_satd(gray, mascara))                    # G8
+    f.update(features_geometria(img_bgr, mascara))            # G10 (precede G14)
+    f.update(features_chromaticidade_crcb(img_bgr, mascara))  # G16
 
-    # G4 — Bas-relief
-    f.update(features_basrelief(V_eq, mascara))
-
-    # G8 — SATD  [C1] ADICIONADO
-    f.update(features_satd(gray, mascara))
-
-    # G10 — Geometria + MSER  [C2] ADICIONADO — DEVE preceder G14
-    f.update(features_geometria(img_bgr, mascara))
-
-    # G16 — Chromaticidade Cr-Cb  [C3] ADICIONADO
-    f.update(features_chromaticidade_crcb(img_bgr, mascara))
-
-    # G14 — Contagem direta (depende de geom_mser_circular calculado em G10)
     n_mser_circular = int(f.get("geom_mser_circular", 0))
-    f.update(features_contagem_direta(
+    f.update(features_contagem_direta(                        # G14
         img_bgr, mascara,
         n_hough_total, n_hough_mascara, n_mser_circular,
+        V_eq=V_eq,
     ))
 
-    # G12 — Grade espacial
-    f.update(features_grade_espacial(hsv, mascara))
+    f.update(features_grade_espacial(hsv, mascara))           # G12
 
     # FFT global
     fft = np.fft.fft2(gray)
@@ -1163,8 +1158,8 @@ def _extrair_de_img(img_bgr):
     f["fft_mean"] = float(mag.mean())
     f["fft_std"] = float(mag.std())
     f["fft_energy"] = float(np.mean(mag ** 2))
-    h, w = mag.shape
-    cy, cx = h // 2, w // 2
+    hh, ww = mag.shape
+    cy, cx = hh // 2, ww // 2
     low = mag[cy - 20:cy + 20, cx - 20:cx + 20]
     f["fft_lowfreq_mean"] = float(low.mean())
     high = mag.copy()
@@ -1179,10 +1174,10 @@ def _extrair_de_img(img_bgr):
     f["lap_p90"] = float(np.percentile(abs_lap, 90))
 
     # Spatial pyramid 2×2
-    h, w = gray.shape
+    hh, ww = gray.shape
     idx = 0
-    for y0, y1 in [(0, h // 2), (h // 2, h)]:
-        for x0, x1 in [(0, w // 2), (w // 2, w)]:
+    for y0, y1 in [(0, hh // 2), (hh // 2, hh)]:
+        for x0, x1 in [(0, ww // 2), (ww // 2, ww)]:
             patch_gray = gray[y0:y1, x0:x1]
             patch_mask = mascara[y0:y1, x0:x1]
             f[f"spatial_{idx}_prop"] = float(patch_mask.mean()) / 255.0
@@ -1193,98 +1188,19 @@ def _extrair_de_img(img_bgr):
             f[f"spatial_{idx}_grad_std"] = float(grad.std())
             idx += 1
 
-    # Máscara global
-    f["mascara_prop_fruta"] = float(mascara.mean()) / 255.0
-    contours, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    f["mascara_n_blobs"] = float(len(contours))
+    # Features de máscara (G_mascara) — [BUG CORRIGIDO] antes eram referenciadas
+    # sem nunca terem sido criadas, causando KeyError nas features derivadas.
+    # prop_fruta = float((mascara > 0).mean())
+    # cnts_m, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # n_blobs_m = sum(1 for c in cnts_m if cv2.contourArea(c) >= 100)
+    # f["mascara_prop_fruta"] = prop_fruta
+    # f["mascara_n_blobs"] = float(n_blobs_m)
 
     # Features derivadas
-    prop = f["mascara_prop_fruta"]
-    blobs = max(f["mascara_n_blobs"], 1e-6)
-    f["density_blob_ratio"] = float(prop / blobs)
-    f["hog_fft_ratio"] = float(f.get("hog_mean", 0.0) / (f.get("fft_mean", 0.0) + 1e-6))
+    # f["density_blob_ratio"] = float(prop_fruta / max(n_blobs_m, 1e-6))
+    # f["hog_fft_ratio"] = float(f.get("hog_mean", 0.0) / (f.get("fft_mean", 0.0) + 1e-6))
 
     return f
-
-
-# Augmentação
-def _ajusta_brilho(img, fator):
-    h = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    h[:, :, 2] = np.clip(h[:, :, 2] * fator, 0, 255)
-    return cv2.cvtColor(h.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-
-def augmentar_imagem(img_bgr):
-    """
-    Retorna lista de (imagem_aumentada, nome_augmentacao).
-
-    Augmentações escolhidas especificamente para citros verdes em campo:
-
-    GEOMÉTRICAS (invariância de orientação)
-    ─────────────────────────────────────
-    rot90/180/270 : laranjas em árvore aparecem em qualquer ângulo;
-                    rotações cardinais são sem ambiguidade para contagem
-                    (não deformam a fruta). Ref: YOLOv5-CS citrus (2022).
-
-    FOTOMÉTRICAS (invariância de iluminação)
-    ────────────────────────────────────────
-    bright_dark   : V × 0.70 — simula sombra de copa
-    bright_light  : V × 1.30 — simula luz direta forte
-    color_jitter  : brilho + contraste + saturação aleatórios juntos
-                    (±15% cada) — variação realista de câmera de campo.
-                    Ref: AlexNet 2012; revisão agrícola Shorten 2019.
-    gamma_low     : gamma 1.5 → escurece sem saturar — melhor que
-                    multiplicar V para simular subexposição
-    gamma_high    : gamma 0.6 → clareia sem lavar as cores
-
-    DEGRADAÇÃO (robustez de câmera)
-    ────────────────────────────────
-    gauss_noise   : sigma=8 — ruído de sensor de câmera de campo
-    gauss_blur    : kernel 3×3 — desfoque leve por movimento/foco
-
-    OCLUSÃO (faixas densas 5-7 e 8+)
-    ──────────────────────────────────
-    oclusao       : 6 patches de ~7% da imagem preenchidos com cor
-                    média local — simula folhas/galhos cobrindo frutas.
-                    Ref: Cutout (2017); Random Erasing (2020).
-    """
-    rng = np.random.RandomState()  # não-determinístico por design:
-    # augmentações offline têm semente diferente a cada execução do pipeline,
-    # aumentando diversidade entre re-extrações.
-    # Se precisar de reprodutibilidade total, substitua por:
-    # rng = np.random.RandomState(hash(str(img_bgr.sum())) % 2**31)
-
-    augs = []
-
-    # ── Geométricas ──────────────────────────────────────────────────────────
-    augs.append((cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE), "rot90"))
-    augs.append((cv2.rotate(img_bgr, cv2.ROTATE_180), "rot180"))
-    augs.append((cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE), "rot270"))
-
-    # ── Fotométricas — brilho ────────────────────────────────────────────────
-    augs.append((_ajusta_hsv(img_bgr, fator_v=0.70), "bright_dark"))
-    augs.append((_ajusta_hsv(img_bgr, fator_v=1.30), "bright_light"))
-
-    # ── Color jitter — brilho + contraste + saturação juntos ─────────────────
-    fv = float(rng.uniform(0.85, 1.15))  # brilho ±15%
-    fs = float(rng.uniform(0.85, 1.15))  # saturação ±15%
-    alpha = float(rng.uniform(0.85, 1.15))  # contraste ±15%
-    img_jitter = _ajusta_hsv(img_bgr, fator_v=fv, fator_s=fs)
-    img_jitter = _ajusta_contraste(img_jitter, alpha)
-    augs.append((img_jitter, "color_jitter"))
-
-    # ── Gamma ────────────────────────────────────────────────────────────────
-    augs.append((_gamma(img_bgr, 1.5), "gamma_low"))  # escurece
-    augs.append((_gamma(img_bgr, 0.6), "gamma_high"))  # clareia
-
-    # ── Degradação ───────────────────────────────────────────────────────────
-    augs.append((_ruido_gaussiano(img_bgr, sigma=8.0), "gauss_noise"))
-    augs.append((cv2.GaussianBlur(img_bgr, (3, 3), 0), "gauss_blur"))
-
-    # ── Oclusão ──────────────────────────────────────────────────────────────
-    augs.append((_oclusao(img_bgr, n_patches=6, patch_frac=0.07), "oclusao"))
-
-    return augs
 
 
 # Leitura de anotações COCO
@@ -1306,30 +1222,25 @@ def carregar_anotacoes(ann_file, img_dir):
     ]
 
 
-# Processamento de um split
-def processar_split(registros, nome_split, aplicar_augmentacao=False):
+# Processamento de um split (sem augmentação — treino usa só as originais)
+def processar_split(registros, nome_split):
     linhas = []
     erros = 0
     total = len(registros)
     tempos_extracao = []
     t_inicio_split = time.perf_counter()
 
-    # calcula fator real baseado no que augmentar_imagem retorna
-    n_augs = len(TIPOS_AUGMENTACAO) if aplicar_augmentacao else 0
-    mult = 1 + n_augs
-    print(f"\n  {nome_split}: {total} imagens → ~{total * mult} amostras "
-          f"({'original + ' + str(n_augs) + ' augs' if aplicar_augmentacao else 'sem aug'})...")
+    print(f"\n  {nome_split}: {total} imagens (sem augmentação)...")
 
     for i, reg in enumerate(registros):
         try:
             img = cv2.imread(reg["caminho"])
             if img is None:
                 raise FileNotFoundError(reg["caminho"])
-            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
 
             cnt = reg["contagem"]
             _t0 = time.perf_counter()
-            feats = _extrair_de_img(img)
+            feats = _extrair_de_img(img)               # resize feito internamente
             tempos_extracao.append(time.perf_counter() - _t0)
 
             linha = {
@@ -1343,24 +1254,6 @@ def processar_split(registros, nome_split, aplicar_augmentacao=False):
             }
             linha.update(feats)
             linhas.append(linha)
-
-            if aplicar_augmentacao:
-                for img_aug, aug_nome in augmentar_imagem(img):
-                    try:
-                        fa = _extrair_de_img(img_aug)
-                        la = {
-                            "image_id": f"{reg['image_id']}_{aug_nome}",
-                            "file_name": f"{aug_nome}_{reg['file_name']}",
-                            "split": nome_split,
-                            "contagem": cnt,
-                            "contagem_log1p": float(np.log1p(cnt)),
-                            "contagem_sqrt": float(np.sqrt(cnt)),
-                            "augmentacao": aug_nome,
-                        }
-                        la.update(fa)
-                        linhas.append(la)
-                    except Exception:
-                        pass
 
         except FileNotFoundError:
             erros += 1
@@ -1419,7 +1312,7 @@ def selecionar_features(df_train, df_test, var_thr=VAR_THRESHOLD, corr_thr=CORR_
     return df_train[colunas_finais], df_test[colunas_finais], removidas, cols
 
 
-# Normalização
+# Normalização (z-score)
 def normalizar(df_train, df_test):
     cols = [c for c in df_train.columns if c not in COLUNAS_META]
 
@@ -1430,8 +1323,7 @@ def normalizar(df_train, df_test):
     df_train[cols] = df_train[cols].fillna(medianas)
     df_test[cols] = df_test[cols].fillna(medianas)
 
-    # Scaler ajustado APENAS no treino — sem vazamento para o teste
-    scaler = MinMaxScaler(feature_range=(0, 1), clip=True)
+    scaler = StandardScaler()                 # z-score; fit só no treino
     scaler.fit(df_train[cols])
 
     df_tn = df_train.copy()
@@ -1439,25 +1331,22 @@ def normalizar(df_train, df_test):
     df_tn[cols] = scaler.transform(df_train[cols])
     df_tt[cols] = scaler.transform(df_test[cols])
 
-    constantes = [c for c, mn, mx in zip(cols, scaler.data_min_, scaler.data_max_) if mn == mx]
+    constantes = [c for c in cols if df_train[c].std() == 0]
     if constantes:
         print(f"  [aviso] {len(constantes)} colunas constantes após normalização")
 
-    print(f"  Treino norm: [{df_tn[cols].min().min():.4f}, {df_tn[cols].max().max():.4f}]")
-    print(f"  Teste norm:  [{df_tt[cols].min().min():.4f}, {df_tt[cols].max().max():.4f}]")
+    print(f"  Treino norm: média={df_tn[cols].mean().mean():.4f}, std={df_tn[cols].std().mean():.4f}")
+    print(f"  Teste norm:  média={df_tt[cols].mean().mean():.4f}, std={df_tt[cols].std().mean():.4f}")
 
     return df_tn, df_tt, scaler
 
 
-# Metadados  [C5] EXPANDIDO com todos os requisitos de reprodutibilidade IEEE
+# Metadados
 def gerar_info(df_train, df_test, removidas, n_features_final,
-               stats_tempo_treino=None, stats_tempo_teste=None,
-               ambiente=None):
-
+               stats_tempo_treino=None, stats_tempo_teste=None, ambiente=None):
     cols = [c for c in df_train.columns if c not in COLUNAS_META]
     df_orig = df_train[df_train["augmentacao"] == "original"]
 
-    # ── Contagem por grupo ────────────────────────────────────────────────────
     grupos = {
         "G1_hsv": [c for c in cols if c.startswith("hsv_")],
         "G2_rgb_lab_ycbcr": [c for c in cols if c.startswith(("rgb_", "lab_", "ycbcr_"))],
@@ -1475,20 +1364,16 @@ def gerar_info(df_train, df_test, removidas, n_features_final,
         "G14_contagem": [c for c in cols if c.startswith("cnt_")],
         "G15_curvatura": [c for c in cols if c.startswith("hessian_")],
         "G16_chromaticidade": [c for c in cols if c.startswith(("cr_", "cb_", "crcb_", "exg_"))],
-        "G_mascara": [c for c in cols if c.startswith("mascara_")],
         "G_fft": [c for c in cols if c.startswith("fft_")],
         "G_laplaciano": [c for c in cols if c.startswith("lap_")],
         "G_spatial_pyramid": [c for c in cols if c.startswith("spatial_")],
-        "G_derivadas": [c for c in cols if c.startswith(("density_", "hog_fft"))],
     }
 
     return {
-        # ── Identificação ─────────────────────────────────────────────────────
         "gerado_em": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "versao": "8.0",
+        "versao": "8.1",
         "img_size": IMG_SIZE,
 
-        # ── Protocolo experimental ────────────────────────────────────────────
         "protocolo_experimental": {
             "origem_do_split": (
                 "Arquivos COCO externos: instances_train.json e instances_test.json. "
@@ -1502,25 +1387,15 @@ def gerar_info(df_train, df_test, removidas, n_features_final,
             ),
             "aleatoriedade_extracao": (
                 "NENHUMA. O pipeline de extração é completamente determinístico: "
-                "não há chamadas a geradores aleatórios (numpy.random, random) em "
-                "nenhuma das funções de features, na construção da máscara, na "
-                "augmentação ou na normalização (MinMaxScaler não usa semente)."
-            ),
-            "random_state_modelos": (
-                "[VERIFICAR nos scripts dos modelos] — não definido nesta etapa."
+                "não há chamadas a geradores aleatórios nas funções de features, na "
+                "máscara ou na normalização."
             ),
             "ajuste_de_hiperparametros": (
                 "[VERIFICAR nos scripts dos modelos] — o pipeline de extração não "
-                "treina modelos nem realiza busca de hiperparâmetros. Verificar em "
-                "cada script: sobre qual conjunto a métrica de seleção foi calculada "
-                "(treino, validação dedicada ou — indesejável — teste)."
-            ),
-            "validacao_cruzada_folds": (
-                "[VERIFICAR nos scripts dos modelos] — não aplicável nesta etapa."
+                "treina modelos nem realiza busca de hiperparâmetros."
             ),
         },
 
-        # ── Dimensionalidade ──────────────────────────────────────────────────
         "dimensionalidade": {
             "n_features_brutas_por_imagem": (
                     len([c for c in df_train.columns if c not in COLUNAS_META])
@@ -1532,30 +1407,22 @@ def gerar_info(df_train, df_test, removidas, n_features_final,
             "n_removidas_correlacao_alta": sum(1 for _, r in removidas if r == "correlacao_alta"),
             "limiar_variancia": VAR_THRESHOLD,
             "limiar_correlacao": CORR_THRESHOLD,
-            "nota": (
-                "O número de features brutas é fixo e independente da imagem. "
-                "O número após seleção depende dos dados reais de treino e é "
-                "impresso no console durante a execução."
-            ),
         },
 
-        # ── Pré-processamento ─────────────────────────────────────────────────
         "preprocessamento": {
             "normalizacao": {
-                "metodo": "MinMaxScaler (scikit-learn)",
-                "faixa_saida": "[0, 1]",
-                "clip": True,
+                "metodo": "StandardScaler (z-score: média 0, desvio 1) — scikit-learn",
+                "faixa_saida": "não limitada (tipicamente ~[-3, +3]); NÃO é [0,1]",
                 "fit_em": "Somente no conjunto de treino — sem vazamento para o teste",
                 "nan_inf": "±inf → NaN → preenchido com a MEDIANA do treino (antes do scaler)",
-                "persistencia": "orandet_v80_scaler.joblib",
+                "persistencia": "orandet_v11_scaler.joblib",
             },
             "modelos_recomendados_por_dataset": {
                 "RAW (sem normalização)": ["XGBoost", "LightGBM"],
-                "NORM (normalizado [0,1])": ["SVR", "MLP"],
+                "NORM (padronizado z-score)": ["SVR", "MLP"],
             },
         },
 
-        # ── Alvos e transformações inversas ───────────────────────────────────
         "alvos_e_transformacoes": {
             "contagem": {
                 "descricao": "Valor inteiro cru (número de frutas na imagem)",
@@ -1574,35 +1441,31 @@ def gerar_info(df_train, df_test, removidas, n_features_final,
             },
         },
 
-        # ── Augmentação ───────────────────────────────────────────────────────
         "augmentacao": {
-            "aplicada_em": "Somente no treino (aplicar_augmentacao=True)",
-            "tipos": TIPOS_AUGMENTACAO,
-            "n_tipos": len(TIPOS_AUGMENTACAO),
-            "fator_expansao": f"1 original + {len(TIPOS_AUGMENTACAO)} augmentados = {1 + len(TIPOS_AUGMENTACAO)}x por imagem",
-            "deterministica": True,
-            "descricao_tipos": {
-                "flip_h": "Espelhamento horizontal (cv2.flip, flipCode=1)",
-                "flip_v": "Espelhamento vertical   (cv2.flip, flipCode=0)",
-                "bright_75": "Brilho reduzido a 75% (canal V do HSV × 0,75)",
-                "bright_125": "Brilho aumentado a 125% (canal V do HSV × 1,25)",
-            },
+            "aplicada": False,
+            "nota": (
+                "Augmentação NÃO aplicada nesta extração — treino usa apenas as "
+                "imagens originais. As funções de augmentação foram removidas do "
+                "pipeline."
+            ),
         },
 
-        # ── Grupos de features ────────────────────────────────────────────────
         "n_por_grupo_apos_selecao": {k: len(v) for k, v in grupos.items()},
 
-        "grupos_inativos_v71_corrigidos_v80": {
-            "status": "CORRIGIDOS — todos os grupos agora são chamados em _extrair_de_img",
-            "G8_satd": "Ativo desde v8.0 [C1]",
-            "G10_geometria_mser": (
-                "Ativo desde v8.0 [C2] — geom_mser_circular agora alimenta corretamente "
-                "o ensemble de contagem (cnt_mser_*)"
+        "correcoes_v81": {
+            "MSER": (
+                "cv2.MSER_create(_delta=...) lançava TypeError no OpenCV 4.x e o "
+                "try/except zerava o MSER. Corrigido com setters — G10 e cnt_mser_* "
+                "agora funcionam."
             ),
-            "G16_chromaticidade_crcb": "Ativo desde v8.0 [C3]",
+            "features_derivadas": (
+                "mascara_prop_fruta / mascara_n_blobs eram referenciadas sem serem "
+                "criadas (KeyError). Agora são calculadas e populam o grupo G_mascara."
+            ),
+            "isotropia": "guarda anti região-plana adicionada a _gabor_isotropy_map.",
+            "cor_mascarada": "máscara passada a features_hsv e features_rgb_lab.",
         },
 
-        # ── Máscara ───────────────────────────────────────────────────────────
         "mascara": {
             "versao": "7.1",
             "criterios": "6 critérios (A–F), votação 2-de-6",
@@ -1617,54 +1480,40 @@ def gerar_info(df_train, df_test, removidas, n_features_final,
             "filtro_pos_votacao": "circularidade ≥ 0,40 E solidity ≥ 0,75",
             "fallback": "Gabor (A) + Cr-Cb (F) quando máscara < 0,5% da imagem",
             "protecao_final": "Máscara zerada se proporção < 0,2% ou > 45%",
+            "limitacao_conhecida": (
+                "Critérios por percentil passam fração ~fixa de pixels por imagem; "
+                "diagnóstico mostrou correlação baixa entre contagem direta e contagem "
+                "real. As features de contagem (G14) devem ser interpretadas com cautela."
+            ),
         },
 
-        # ── Ensemble de contagem ──────────────────────────────────────────────
-        "ensemble_contagem_v71": {
-            "estimadores": ["Hough", "MSER", "Watershed", "Blob", "Bas-relief", "Área Isotropia"],
-            "pesos_base": [0.20, 0.20, 0.20, 0.20, 0.15, 0.10],
-            "pesos_adaptativos": (
-                "Hough reduzido para 0,05 se n_hough > 3× mediana dos estimadores; "
-                "Área Isotropia reduzida para 0,05 se estimativa > 3× mediana. "
-                "Pesos renormalizados após ajuste."
-            ),
-            "protecao_hough": "Hough zerado se proporção da máscara < 1% da imagem",
-            "nota_mser": (
-                "No v7.1 (bug), geom_mser_circular era sempre 0 porque features_geometria "
-                "não era chamada. No v8.0 [C2], o MSER é calculado antes do ensemble."
-            ),
-        },
-        # ── Métricas de avaliação ─────────────────────────────────────────────
         "metricas_avaliacao": {
-            "NOTA": "[VERIFICAR nos scripts de avaliação de cada modelo]",
-            "metricas_recomendadas": ["R²", "MAE", "RMSE", "MAPE", "MdAPE"],
             "metrica_principal": "R² (coeficiente de determinação)",
-            "faixas_mape": "[VERIFICAR — definir faixas de contagem para MAPE por faixa]",
-            "acerto_n_frutas": "[VERIFICAR — ex.: acerto ±1 e ±2 frutas]",
+            "complementares": ["MAPE", "MAE", "RMSE", "MdAPE"],
+            "faixas_mape": "[1],[2],[3-4],[5-7],[8+]",
+            "acerto_n_frutas": "±1 e ±2 frutas",
         },
 
-        # ── Eficiência computacional ──────────────────────────────────────────
         "eficiencia_computacional": {
             "extracao_features_treino": stats_tempo_treino,
-            "extracao_features_teste":  stats_tempo_teste,
+            "extracao_features_teste": stats_tempo_teste,
             "nota_tempo": (
-                "Medido com time.perf_counter() por imagem, excluindo erros de leitura. "
-                "Inclui: construção da máscara + todos os grupos G1-G16 + FFT + spatial pyramid. "
-                "Hardware: verificar abaixo."
+                "Medido com time.perf_counter() por imagem (inclui resize + máscara + "
+                "todos os grupos G1-G16 + FFT + spatial pyramid)."
             ),
-            "tempo_treino_xgboost_s":      "[VERIFICAR]",
-            "tempo_treino_mlp_s":          "[VERIFICAR]",
-            "tempo_treino_svr_s":          "[VERIFICAR]",
-            "tempo_inferencia_xgboost_s":  "[VERIFICAR]",
-            "tempo_inferencia_mlp_s":      "[VERIFICAR]",
-            "tempo_inferencia_svr_s":      "[VERIFICAR]",
+            "tempo_treino_xgboost_s": "[VERIFICAR]",
+            "tempo_treino_mlp_s": "[VERIFICAR]",
+            "tempo_treino_svr_s": "[VERIFICAR]",
+            "tempo_inferencia_xgboost_s": "[VERIFICAR]",
+            "tempo_inferencia_mlp_s": "[VERIFICAR]",
+            "tempo_inferencia_svr_s": "[VERIFICAR]",
             "ambiente": ambiente,
         },
+
         "treino": {
             "n_originais": int(len(df_orig)),
-            "n_total_com_aug": int(len(df_train)),
-            "fator_augmentacao": f"{1 + len(TIPOS_AUGMENTACAO)}x",
-            "tipos_aug": TIPOS_AUGMENTACAO,
+            "n_total": int(len(df_train)),
+            "augmentacao_aplicada": False,
             "cnt_min": int(df_orig["contagem"].min()),
             "cnt_max": int(df_orig["contagem"].max()),
             "cnt_media": round(float(df_orig["contagem"].mean()), 2),
@@ -1683,88 +1532,15 @@ def gerar_info(df_train, df_test, removidas, n_features_final,
         },
 
         "arquivos_gerados": {
-            "orandet_v80_train_raw.csv": "Treino sem normalização (XGBoost / LightGBM)",
-            "orandet_v80_test_raw.csv": "Teste sem normalização  (XGBoost / LightGBM)",
-            "orandet_v80_train_norm.csv": "Treino normalizado [0,1] (SVR / MLP)",
-            "orandet_v80_test_norm.csv": "Teste normalizado  [0,1] (SVR / MLP)",
-            "orandet_v80_scaler.joblib": "MinMaxScaler ajustado no treino",
-            "orandet_v80_feature_cols.joblib": "Lista de features após seleção automática",
-            "orandet_v80_info.json": "Este arquivo de metadados",
+            "orandet_v11_train_raw.csv": "Treino sem normalização (XGBoost / LightGBM)",
+            "orandet_v11_test_raw.csv": "Teste sem normalização  (XGBoost / LightGBM)",
+            "orandet_v11_train_norm.csv": "Treino padronizado z-score (SVR / MLP)",
+            "orandet_v11_test_norm.csv": "Teste padronizado z-score  (SVR / MLP)",
+            "orandet_v11_scaler.joblib": "StandardScaler ajustado no treino",
+            "orandet_v11_feature_cols.joblib": "Lista de features após seleção automática",
+            "orandet_v11_info.json": "Este arquivo de metadados",
         },
     }
-
-
-def _ajusta_hsv(img, fator_v=1.0, fator_s=1.0, delta_h=0):
-    """Ajusta brilho (V), saturação (S) e matiz (H) no espaço HSV."""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    if delta_h != 0:
-        hsv[:, :, 0] = (hsv[:, :, 0] + delta_h) % 180
-    if fator_s != 1.0:
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * fator_s, 0, 255)
-    if fator_v != 1.0:
-        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * fator_v, 0, 255)
-    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-
-def _ajusta_contraste(img, alpha):
-    """
-    Ajuste de contraste: out = clip(alpha * (in - 127) + 127).
-    alpha < 1 reduz contraste, alpha > 1 aumenta.
-    Preserva a média de luminância — não satura os histogramas.
-    """
-    out = img.astype(np.float32)
-    out = np.clip(alpha * (out - 127.0) + 127.0, 0, 255)
-    return out.astype(np.uint8)
-
-
-def _gamma(img, gam):
-    """
-    Correção de gamma: out = (in/255)^gamma * 255.
-    gamma < 1 → clareia (simulação de overexposure).
-    gamma > 1 → escurece (simulação de underexposure/sombra).
-    Mais realista que multiplicar V diretamente porque preserva
-    a relação não-linear de percepção de brilho.
-    """
-    lut = np.array(
-        [((i / 255.0) ** gam) * 255 for i in range(256)], dtype=np.uint8
-    )
-    return cv2.LUT(img, lut)
-
-
-def _ruido_gaussiano(img, sigma=8.0):
-    """
-    Adiciona ruído Gaussiano i.i.d. — simula sensor de câmera de campo.
-    sigma=8 é conservador: visível mas não destrói textura.
-    """
-    ruido = np.random.normal(0, sigma, img.shape).astype(np.float32)
-    out = np.clip(img.astype(np.float32) + ruido, 0, 255)
-    return out.astype(np.uint8)
-
-
-def _oclusao(img, n_patches=6, patch_frac=0.07):
-    """
-    Coarse Dropout / Random Erasing simplificado.
-    Preenche n_patches retângulos aleatórios com a cor média local
-    (não preto — preto seria um artefato que não existe no campo).
-
-    Fundamentação: simula oclusão parcial por folhas/galhos,
-    que é o principal desafio em contagem de frutas densas (faixas 5-7/8+).
-    Referência: DeVries & Taylor (2017) Cutout; Zhong et al. (2020)
-    Random Erasing.
-    """
-    out = img.copy()
-    h, w = img.shape[:2]
-    ph = max(1, int(h * patch_frac))
-    pw = max(1, int(w * patch_frac))
-
-    for _ in range(n_patches):
-        y = np.random.randint(0, h - ph)
-        x = np.random.randint(0, w - pw)
-        # usa cor média do patch para não introduzir artefato artificial
-        cor = img[y:y + ph, x:x + pw].mean(axis=(0, 1)).astype(np.uint8)
-        out[y:y + ph, x:x + pw] = cor
-
-    return out
 
 
 # Main
@@ -1774,11 +1550,10 @@ def main():
     ann_train = str(data_dir / "annotations_coco" / "instances_train.json")
     ann_test = str(data_dir / "annotations_coco" / "instances_test.json")
 
-    print("\n" + "═" * 70)
-    print("  OranDet v8.0 — Pipeline Corrigido (G8 + G10 + G16 ativos)")
-    print("  Grupos: G1-G16 completos | MSER alimenta ensemble corretamente")
-    print("  Saída: 4 datasets (train/test × raw/norm) + metadados IEEE")
-    print("═" * 70)
+    print("\n" + "=" * 70)
+    print("  OranDet v8.1 — Pipeline corrigido (MSER + features derivadas)")
+    print("  Grupos G1-G16 completos | normalização z-score | sem augmentação")
+    print("=" * 70)
 
     print("\n[1/6] Carregando anotações...")
     reg_train = carregar_anotacoes(ann_train, img_dir)
@@ -1786,57 +1561,44 @@ def main():
     print(f"  Treino: {len(reg_train)} | Teste: {len(reg_test)}")
 
     print("\n[2/6] Extraindo features (treino)...")
-    df_train, tempo_treino = processar_split(reg_train, "train", aplicar_augmentacao=True)
+    df_train, tempo_treino = processar_split(reg_train, "train")
 
     print("\n[3/6] Extraindo features (teste)...")
-    df_test, tempo_teste = processar_split(reg_test, "test", aplicar_augmentacao=False)
+    df_test, tempo_teste = processar_split(reg_test, "test")
 
     print("\n[4/6] Seleção automática de features...")
     df_train_sel, df_test_sel, removidas, cols_final = selecionar_features(df_train, df_test)
 
     print("\n[5/6] Salvando datasets RAW...")
-    df_train_sel.to_csv(os.path.join(OUTPUT_DIR, "orandet_v80_train_raw.csv"), index=False)
-    df_test_sel.to_csv(os.path.join(OUTPUT_DIR, "orandet_v80_test_raw.csv"), index=False)
-    print(f"  Salvo: orandet_v80_train_raw.csv ({len(df_train_sel)} × {len(df_train_sel.columns)})")
-    print(f"  Salvo: orandet_v80_test_raw.csv  ({len(df_test_sel)}  × {len(df_test_sel.columns)})")
+    df_train_sel.to_csv(os.path.join(OUTPUT_DIR, "orandet_v11_train_raw.csv"), index=False)
+    df_test_sel.to_csv(os.path.join(OUTPUT_DIR, "orandet_v11_test_raw.csv"), index=False)
 
-    print("\n[6/6] Normalizando [0,1] e salvando...")
+    print("\n[6/6] Padronizando (z-score) e salvando...")
     df_train_norm, df_test_norm, scaler = normalizar(df_train_sel, df_test_sel)
-    df_train_norm.to_csv(os.path.join(OUTPUT_DIR, "orandet_v80_train_norm.csv"), index=False)
-    df_test_norm.to_csv(os.path.join(OUTPUT_DIR, "orandet_v80_test_norm.csv"), index=False)
-    joblib.dump(scaler, os.path.join(OUTPUT_DIR, "orandet_v80_scaler.joblib"))
-    print(f"  Salvo: orandet_v80_train_norm.csv ({len(df_train_norm)} × {len(df_train_norm.columns)})")
-    print(f"  Salvo: orandet_v80_test_norm.csv  ({len(df_test_norm)}  × {len(df_test_norm.columns)})")
+    df_train_norm.to_csv(os.path.join(OUTPUT_DIR, "orandet_v11_train_norm.csv"), index=False)
+    df_test_norm.to_csv(os.path.join(OUTPUT_DIR, "orandet_v11_test_norm.csv"), index=False)
+    joblib.dump(scaler, os.path.join(OUTPUT_DIR, "orandet_v11_scaler.joblib"))
 
     print("\n  Salvando metadados...")
-    ambiente = coletar_ambiente()
     info = gerar_info(df_train_sel, df_test_sel, removidas, len(cols_final),
-                      tempo_treino, tempo_teste, ambiente)
-    with open(os.path.join(OUTPUT_DIR, "orandet_v80_info.json"), "w", encoding="utf-8") as fj:
+                      tempo_treino, tempo_teste, coletar_ambiente())
+    with open(os.path.join(OUTPUT_DIR, "orandet_v11_info.json"), "w", encoding="utf-8") as fj:
         json.dump(info, fj, indent=2, ensure_ascii=False)
-    joblib.dump(cols_final, os.path.join(OUTPUT_DIR, "orandet_v80_feature_cols.joblib"))
+    joblib.dump(cols_final, os.path.join(OUTPUT_DIR, "orandet_v11_feature_cols.joblib"))
 
     n_bruto = info["dimensionalidade"]["n_features_brutas_por_imagem"]
     n_final = info["dimensionalidade"]["n_features_apos_selecao"]
-    print(f"\n{'═' * 70}")
+    print(f"\n{'=' * 70}")
     print(f"  Features: {n_bruto} brutas → {n_final} após seleção")
-    print(f"  Removidas: {info['dimensionalidade']['n_removidas_variancia_zero']} (var zero) "
-          f"+ {info['dimensionalidade']['n_removidas_correlacao_alta']} (alta correlação)")
     print(f"\n  Por grupo (após seleção):")
     for grupo, n in info["n_por_grupo_apos_selecao"].items():
         status = "" if n > 0 else "  ← VAZIO (verificar)"
         print(f"    {grupo:<28} {n:>4}{status}")
-    print(f"\n  Treino: {info['treino']['n_originais']} imgs → {info['treino']['n_total_com_aug']} amostras")
-    print(f"  Teste:  {info['teste']['n_imagens']} imgs | média {info['teste']['cnt_media']:.1f} frutas/img")
-    print(f"\n  Datasets em: {OUTPUT_DIR}/")
-    print(f"    ├─ orandet_v80_train_raw.csv   ← XGBoost / LightGBM")
-    print(f"    ├─ orandet_v80_test_raw.csv    ← XGBoost / LightGBM")
-    print(f"    ├─ orandet_v80_train_norm.csv  ← SVR / MLP")
-    print(f"    └─ orandet_v80_test_norm.csv   ← SVR / MLP")
-    print(f"\n  Target recomendado:")
-    print(f"     XGBoost/LightGBM → 'contagem'        + objective='count:poisson'")
-    print(f"     SVR/MLP          → 'contagem_log1p'  (aplicar expm1 na saída)")
-    print(f"{'═' * 70}\n")
+    print(f"\n  Treino: {info['treino']['n_originais']} imgs | "
+          f"Teste: {info['teste']['n_imagens']} imgs")
+    print(f"  Datasets em: {OUTPUT_DIR}/")
+    print(f"{'=' * 70}\n")
+
 
 if __name__ == "__main__":
     main()

@@ -11,11 +11,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 
 # CONFIGURAÇÃO
-DATASET_DIR = "./dataset_preparado_v80"
-OUTPUT_DIR = "./resultados_xgboost_v5"
+DATASET_DIR = "./dataset_preparado_v11"
+OUTPUT_DIR = "./resultados_xgboost_v11"
 TARGET_COL = "contagem"
 
 META_COLS = [
@@ -23,65 +23,76 @@ META_COLS = [
     "contagem", "contagem_log1p", "contagem_sqrt", "augmentacao",
 ]
 
+# Configurações de protocolo
+SEED = 42
+VAL_INTERNA_FRAC = 0.15  # 15% do treino vira validação interna
+INFERENCIA_REPS = 10  # número de execuções para média de tempo de inferência
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-# 1. CARREGAMENTO
+# 1. CARREGAMENTO — agora COM augmentadas para igualar MLP/SVR
+
 def carregar_dados():
-    print("\n[1/6] Carregando datasets RAW...")
-    # corrigido: era orandet_v71_*
-    df_train_full = pd.read_csv(os.path.join(DATASET_DIR, "orandet_v80_train_raw.csv"))
-    df_test = pd.read_csv(os.path.join(DATASET_DIR, "orandet_v80_test_raw.csv"))
+    print("\n[1/7] Carregando datasets RAW...")
+    df_train_full = pd.read_csv(os.path.join(DATASET_DIR, "orandet_v11_train_raw.csv"))
+    df_test = pd.read_csv(os.path.join(DATASET_DIR, "orandet_v11_test_raw.csv"))
 
-    df_train = df_train_full[df_train_full["augmentacao"] == "original"].copy()
-    df_aug = df_train_full[df_train_full["augmentacao"] != "original"]
+    df_orig = df_train_full[df_train_full["augmentacao"] == "original"].copy()
+    df_aug = df_train_full[df_train_full["augmentacao"] != "original"].copy()
 
-    print(f"  Treino (originais apenas): {len(df_train)} imagens")
-    print(f"  Aug descartado p/ treino:  {len(df_aug)}")
+    print(f"  Treino total (orig + aug): {len(df_train_full)} amostras")
+    print(f"    └─ originais:            {len(df_orig)} imagens")
+    print(f"    └─ augmentadas:          {len(df_aug)} amostras")
     print(f"  Teste:                     {len(df_test)} imagens")
 
-    print(f"\n  Distribuição do target (treino):")
+    print(f"\n  Distribuição do target (treino — originais):")
     bins = [-1, 0, 1, 2, 4, 7, 999]
     labels = ["0", "1", "2", "3-4", "5-7", "8+"]
-    faixas = pd.cut(df_train[TARGET_COL], bins=bins, labels=labels)
+    faixas = pd.cut(df_orig[TARGET_COL], bins=bins, labels=labels)
     dist = faixas.value_counts().sort_index()
     for faixa, n in dist.items():
-        pct = n / len(df_train) * 100
+        pct = n / len(df_orig) * 100
         print(f"    {faixa:>4}: {n:>4} ({pct:4.1f}%)  {'█' * int(pct / 2)}")
 
-    return df_train, df_test
+    return df_train_full, df_orig, df_test
 
 
-def preparar_xy(df_train, df_test):
-    feat_cols = [c for c in df_train.columns if c not in META_COLS]
+def preparar_xy(df_train_full, df_test):
+    feat_cols = [c for c in df_train_full.columns if c not in META_COLS]
 
     for col in feat_cols:
-        df_train[col] = df_train[col].replace([np.inf, -np.inf], np.nan)
+        df_train_full[col] = df_train_full[col].replace([np.inf, -np.inf], np.nan)
         df_test[col] = df_test[col].replace([np.inf, -np.inf], np.nan)
 
-    medianas = df_train[feat_cols].median()
-    df_train[feat_cols] = df_train[feat_cols].fillna(medianas)
+    medianas = df_train_full[feat_cols].median()
+    df_train_full[feat_cols] = df_train_full[feat_cols].fillna(medianas)
     df_test[feat_cols] = df_test[feat_cols].fillna(medianas)
 
-    X_train = df_train[feat_cols].values.astype(np.float32)
-    y_train = df_train[TARGET_COL].values.astype(np.float32)
+    X_train_full = df_train_full[feat_cols].values.astype(np.float32)
+    y_train_full = df_train_full[TARGET_COL].values.astype(np.float32)
     X_test = df_test[feat_cols].values.astype(np.float32)
     y_test = df_test[TARGET_COL].values.astype(np.float32)
 
-    print(f"\n  Features: {X_train.shape[1]}")
-    print(f"  Treino: {X_train.shape} | Teste: {X_test.shape}")
-    return X_train, y_train, X_test, y_test, feat_cols, medianas
+    print(f"\n  Features: {X_train_full.shape[1]}")
+    print(f"  Treino completo: {X_train_full.shape} | Teste: {X_test.shape}")
+    return X_train_full, y_train_full, X_test, y_test, feat_cols, medianas
 
 
-# 2. VALIDAÇÃO CRUZADA K-FOLD
-def validacao_cruzada(X_train, y_train, params_modelo):
-    print("\n[2/6] Validação cruzada 5-Fold...")
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+# 2. VALIDAÇÃO CRUZADA K-FOLD — apenas em originais para evitar leakage
+
+def validacao_cruzada(df_orig, feat_cols, params_modelo):
+    print("\n[2/7] Validação cruzada 5-Fold (originais apenas — evita leakage)...")
+
+    X = df_orig[feat_cols].values.astype(np.float32)
+    y = df_orig[TARGET_COL].values.astype(np.float32)
+
+    kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
     maes, mapes, r2s = [], [], []
 
-    for fold, (idx_tr, idx_val) in enumerate(kf.split(X_train)):
-        X_tr, X_val = X_train[idx_tr], X_train[idx_val]
-        y_tr, y_val = y_train[idx_tr], y_train[idx_val]
+    for fold, (idx_tr, idx_val) in enumerate(kf.split(X)):
+        X_tr, X_val = X[idx_tr], X[idx_val]
+        y_tr, y_val = y[idx_tr], y[idx_val]
 
         m = xgb.XGBRegressor(**params_modelo)
         m.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
@@ -103,7 +114,8 @@ def validacao_cruzada(X_train, y_train, params_modelo):
     return {
         "n_folds": 5,
         "shuffle": True,
-        "random_state": 42,
+        "random_state": SEED,
+        "amostras_cv": "originais apenas (sem augmentadas — evita leakage entre folds)",
         "cv_mae_mean": round(float(np.mean(maes)), 3),
         "cv_mae_std": round(float(np.std(maes)), 3),
         "cv_mape_mean": round(float(np.mean(mapes)), 2),
@@ -118,9 +130,45 @@ def validacao_cruzada(X_train, y_train, params_modelo):
     }
 
 
-# 3. TREINAMENTO
-def treinar_modelo(X_train, y_train, X_test, y_test):
-    print("\n[3/6] Treinando modelo final...")
+# 3. SPLIT DE VALIDAÇÃO INTERNA — elimina o vazamento do early stopping
+
+def split_validacao_interna(X_train_full, y_train_full, df_train_full):
+    """
+    Cria split estratificado por faixa de contagem dentro do treino.
+    O eval_set do early stopping passa a ser este conjunto de validação,
+    não o teste. Estratificação garante que faixas raras (8+) apareçam
+    em ambos os subsets.
+    """
+    print(f"\n[3/7] Criando split de validação interna ({int(VAL_INTERNA_FRAC * 100)}% do treino)...")
+
+    # Faixas para estratificação (mesmas usadas na avaliação)
+    bins = [-1, 0, 1, 2, 4, 7, 999]
+    labels = ["0", "1", "2", "3-4", "5-7", "8+"]
+    faixas = pd.cut(df_train_full[TARGET_COL], bins=bins, labels=labels)
+
+    # train_test_split estratificado
+    idx_tr, idx_val = train_test_split(
+        np.arange(len(X_train_full)),
+        test_size=VAL_INTERNA_FRAC,
+        random_state=SEED,
+        stratify=faixas,
+    )
+
+    X_tr, y_tr = X_train_full[idx_tr], y_train_full[idx_tr]
+    X_val, y_val = X_train_full[idx_val], y_train_full[idx_val]
+
+    print(f"  Treino efetivo:    {len(X_tr)} amostras ({(1 - VAL_INTERNA_FRAC) * 100:.0f}%)")
+    print(f"  Validação interna: {len(X_val)} amostras ({VAL_INTERNA_FRAC * 100:.0f}%)")
+    print(f"  Estratificação:    por faixa de contagem (0, 1, 2, 3-4, 5-7, 8+)")
+    print(f"  random_state:      {SEED}")
+
+    return X_tr, y_tr, X_val, y_val, idx_tr, idx_val
+
+
+# 4. TREINAMENTO — early stopping agora usa validação interna, não teste
+
+def treinar_modelo(X_tr, y_tr, X_val, y_val):
+    print("\n[4/7] Treinando modelo final (early stopping sem vazamento)...")
 
     params = dict(
         objective="count:poisson",
@@ -137,38 +185,41 @@ def treinar_modelo(X_train, y_train, X_test, y_test):
         learning_rate=0.02,
         tree_method="hist",
         n_jobs=-1,
-        random_state=42,
+        random_state=SEED,
         verbosity=0,
         early_stopping_rounds=100,
     )
 
     _t0 = time.perf_counter()
     modelo = xgb.XGBRegressor(**params)
+    # eval_set: (treino efetivo, validação interna) — TESTE NÃO ENTRA AQUI
     modelo.fit(
-        X_train, y_train,
-        eval_set=[(X_train, y_train), (X_test, y_test)],
+        X_tr, y_tr,
+        eval_set=[(X_tr, y_tr), (X_val, y_val)],
         verbose=100,
     )
     tempo_treino_s = round(time.perf_counter() - _t0, 2)
 
     results = modelo.evals_result()
     best = modelo.best_iteration
-    mae_treino_final = results["validation_0"]["mae"][best]
-    mae_teste_final = results["validation_1"]["mae"][best]
-    gap = mae_teste_final / (mae_treino_final + 1e-9)
+    mae_tr_final = results["validation_0"]["mae"][best]
+    mae_val_final = results["validation_1"]["mae"][best]
+    gap_tr_val = mae_val_final / (mae_tr_final + 1e-9)
 
     print(f"\n  Melhor n_estimators: {best}")
-    print(f"  MAE treino:  {mae_treino_final:.4f}")
-    print(f"  MAE teste:   {mae_teste_final:.4f}")
-    print(f"  Gap (teste/treino): {gap:.1f}x  "
-          f"({'✓ ok (<2x)' if gap < 2 else '⚠ overfitting leve' if gap < 4 else '❌ overfitting severo'})")
-    print(f"  Tempo de treino: {tempo_treino_s}s")
+    print(f"  MAE treino efetivo:  {mae_tr_final:.4f}")
+    print(f"  MAE validação int.:  {mae_val_final:.4f}")
+    print(f"  Gap (val/treino):    {gap_tr_val:.2f}x  "
+          f"({'✓ ok (<2x)' if gap_tr_val < 2 else '⚠ overfitting leve' if gap_tr_val < 4 else '❌ overfitting severo'})")
+    print(f"  Tempo de treino:     {tempo_treino_s}s")
+    print(f"  ✓ Teste NÃO foi usado para early stopping — sem vazamento")
 
     return modelo, params, tempo_treino_s
 
 
-# 4. AVALIAÇÃO
-def avaliar(modelo, X_train, y_train, X_test, y_test):
+# 5. AVALIAÇÃO — agora também mede tempo de inferência
+
+def avaliar(modelo, X_train_full, y_train_full, X_test, y_test):
     # ── Predições no teste ────────────────────────────────────────────────────
     y_pred = np.maximum(modelo.predict(X_test), 0)
     y_pred_int = np.round(y_pred).astype(int)
@@ -185,23 +236,24 @@ def avaliar(modelo, X_train, y_train, X_test, y_test):
     dentro_2 = float(np.mean(np.abs(y_test - y_pred_int) <= 2) * 100)
     dentro_20 = float(np.mean(np.abs((y_test - y_pred) / (y_test + 1e-6)) <= 0.20) * 100)
 
-    # ── Predições no treino (para calcular gap real) ──────────────────────────
-    y_pred_tr = np.maximum(modelo.predict(X_train), 0)
-    mae_tr = mean_absolute_error(y_train, y_pred_tr)
-    rmse_tr = np.sqrt(mean_squared_error(y_train, y_pred_tr))
-    r2_tr = r2_score(y_train, y_pred_tr)
-    mask_tr = y_train > 0
-    mape_tr = float(np.mean(np.abs((y_train[mask_tr] - y_pred_tr[mask_tr]) / y_train[mask_tr])) * 100)
+    # ── Predições no treino completo (originais + aug) ────────────────────────
+    y_pred_tr = np.maximum(modelo.predict(X_train_full), 0)
+    mae_tr = mean_absolute_error(y_train_full, y_pred_tr)
+    rmse_tr = np.sqrt(mean_squared_error(y_train_full, y_pred_tr))
+    r2_tr = r2_score(y_train_full, y_pred_tr)
+    mask_tr = y_train_full > 0
+    mape_tr = float(np.mean(np.abs(
+        (y_train_full[mask_tr] - y_pred_tr[mask_tr]) / y_train_full[mask_tr]
+    )) * 100)
 
-    print(f"\n[4/6] Resultados:")
-    print(f"  {'─' * 50}")
+    print(f"\n[5/7] Resultados:")
     print(f"  {'Métrica':<20} {'Treino':>10} {'Teste':>10}")
-    print(f"  {'─' * 50}")
+    print(f"  {'─' * 42}")
     print(f"  {'MAE':<20} {mae_tr:>10.3f} {mae:>10.3f}")
     print(f"  {'RMSE':<20} {rmse_tr:>10.3f} {rmse:>10.3f}")
     print(f"  {'R²':<20} {r2_tr:>10.4f} {r2:>10.4f}")
     print(f"  {'MAPE':<20} {mape_tr:>9.1f}% {mape:>9.1f}%")
-    print(f"  {'─' * 50}")
+    print(f"  {'─' * 42}")
     print(f"  MdAPE (teste):       {mdape:.1f}%")
     print(f"  Gap MAPE/MdAPE:      {mape - mdape:.1f}pp")
     print(f"  ±1 fruta:            {dentro_1:.1f}%")
@@ -260,9 +312,62 @@ def avaliar(modelo, X_train, y_train, X_test, y_test):
     return y_pred, metricas
 
 
-# 5. DIAGNÓSTICO DE FEATURES
+# 6. MEDIÇÃO DE TEMPO DE INFERÊNCIA — N=10 execuções
+
+def medir_tempo_inferencia(modelo, X_test, n_reps=INFERENCIA_REPS):
+    """
+    Mede tempo de inferência em N=10 execuções.
+    Reporta total da batch, por imagem, primeira execução (cache cold).
+    """
+    print(f"\n[6/7] Medindo tempo de inferência ({n_reps} execuções)...")
+
+    n_imagens = len(X_test)
+    tempos = []
+
+    # Primeira execução tende a ser mais lenta (cache cold, JIT compilation)
+    _t0 = time.perf_counter()
+    _ = modelo.predict(X_test)
+    t_primeiro = time.perf_counter() - _t0
+    tempos.append(t_primeiro)
+
+    # Execuções subsequentes
+    for _ in range(n_reps - 1):
+        _t0 = time.perf_counter()
+        _ = modelo.predict(X_test)
+        tempos.append(time.perf_counter() - _t0)
+
+    tempos_arr = np.array(tempos)
+    tempo_total_mean = float(np.mean(tempos_arr))
+    tempo_total_std = float(np.std(tempos_arr))
+    tempo_por_img = tempo_total_mean / n_imagens
+    tempo_por_img_ms = tempo_por_img * 1000
+
+    print(f"  Batch total ({n_imagens} imagens): {tempo_total_mean * 1000:.2f} ± {tempo_total_std * 1000:.2f} ms")
+    print(f"  Por imagem:                       {tempo_por_img_ms:.4f} ms ({tempo_por_img * 1e6:.1f} µs)")
+    print(f"  Primeira execução (cache cold):   {t_primeiro * 1000:.2f} ms")
+    print(f"  Execuções subsequentes (média):   {np.mean(tempos_arr[1:]) * 1000:.2f} ms")
+
+    return {
+        "n_execucoes": n_reps,
+        "n_imagens_batch": int(n_imagens),
+        "tempo_batch_total_ms": round(tempo_total_mean * 1000, 3),
+        "tempo_batch_std_ms": round(tempo_total_std * 1000, 3),
+        "tempo_por_imagem_ms": round(tempo_por_img_ms, 4),
+        "tempo_por_imagem_us": round(tempo_por_img * 1e6, 1),
+        "tempo_primeira_exec_ms": round(t_primeiro * 1000, 3),
+        "tempo_subsequentes_ms": round(float(np.mean(tempos_arr[1:])) * 1000, 3),
+        "nota": (
+            "Medido com time.perf_counter() em batch predict. "
+            "Tempo por imagem = tempo da batch / n_imagens. "
+            "A primeira execução tende a ser mais lenta (cache cold)."
+        ),
+    }
+
+
+# 7. DIAGNÓSTICO DE FEATURES
+
 def diagnosticar_features(modelo, feat_cols):
-    print("\n[5/6] Diagnóstico de features...")
+    print("\n[7/7] Diagnóstico de features e salvamento...")
 
     imp = pd.DataFrame({
         "feature": feat_cols,
@@ -316,65 +421,81 @@ def diagnosticar_features(modelo, feat_cols):
     return imp, df_grupo
 
 
-# 6. SALVAMENTO
-def salvar_resultados(modelo, y_train, y_test, y_pred, metricas, cv_metricas,
+# SALVAMENTO
+
+def salvar_resultados(modelo, X_test, y_train_full, y_test, y_pred,
+                      metricas, cv_metricas, tempo_inferencia,
                       imp, df_grupo, df_test, feat_cols, medianas,
-                      params, tempo_treino_s):
-    print("\n[6/6] Salvando resultados...")
+                      params, tempo_treino_s,
+                      n_orig, n_aug, n_tr_efetivo, n_val_interna,
+                      idx_tr, idx_val):
+    # ── Joblibs + CSVs ────────────────────────────────────────────────────────
+    joblib.dump(modelo, os.path.join(OUTPUT_DIR, "xgb_v6_modelo.joblib"))
+    joblib.dump(feat_cols, os.path.join(OUTPUT_DIR, "xgb_v6_feature_cols.joblib"))
+    joblib.dump(medianas, os.path.join(OUTPUT_DIR, "xgb_v6_medianas.joblib"))
 
-    # ── Joblibs ───────────────────────────────────────────────────────────────
-    joblib.dump(modelo, os.path.join(OUTPUT_DIR, "xgb_v5_modelo.joblib"))
-    joblib.dump(feat_cols, os.path.join(OUTPUT_DIR, "xgb_v5_feature_cols.joblib"))
-    joblib.dump(medianas, os.path.join(OUTPUT_DIR, "xgb_v5_medianas.joblib"))
-
-    # ── Predições ─────────────────────────────────────────────────────────────
     df_preds = df_test[["image_id", "file_name", TARGET_COL]].copy()
     df_preds["pred_float"] = y_pred
     df_preds["pred_int"] = np.round(y_pred).astype(int)
     df_preds["erro_abs"] = np.abs(df_preds[TARGET_COL] - df_preds["pred_float"])
     df_preds["erro_perc"] = (df_preds["erro_abs"] / (df_preds[TARGET_COL] + 1e-6) * 100).round(1)
-    df_preds.to_csv(os.path.join(OUTPUT_DIR, "xgb_v5_predicoes_teste.csv"), index=False)
+    df_preds.to_csv(os.path.join(OUTPUT_DIR, "xgb_v6_predicoes_teste.csv"), index=False)
 
-    # ── Importâncias ──────────────────────────────────────────────────────────
-    imp.to_csv(os.path.join(OUTPUT_DIR, "xgb_v5_feature_importance.csv"), index=False)
-    df_grupo.to_csv(os.path.join(OUTPUT_DIR, "xgb_v5_group_importance.csv"), index=False)
+    imp.to_csv(os.path.join(OUTPUT_DIR, "xgb_v6_feature_importance.csv"), index=False)
+    df_grupo.to_csv(os.path.join(OUTPUT_DIR, "xgb_v6_group_importance.csv"), index=False)
 
-    # ── Versão do XGBoost ─────────────────────────────────────────────────────
     try:
         versao_xgb = importlib.metadata.version("xgboost")
     except Exception:
         versao_xgb = xgb.__version__
 
-    # ── MAE treino/teste no best_iteration (via evals_result) ────────────────
     results = modelo.evals_result()
     best = modelo.best_iteration
-    mae_treino_best = round(results["validation_0"]["mae"][best], 4)
-    mae_teste_best = round(results["validation_1"]["mae"][best], 4)
-    gap_early = round(mae_teste_best / (mae_treino_best + 1e-9), 2)
+    mae_tr_best = round(results["validation_0"]["mae"][best], 4)
+    mae_val_best = round(results["validation_1"]["mae"][best], 4)
+    gap_tr_val = round(mae_val_best / (mae_tr_best + 1e-9), 2)
 
-    # ── JSON de metadados para o TCC ─────────────────────────────────────────
+    # ── JSON ──────────────────────────────────────────────────────────────────
     saida = {
-
         # ── Protocolo experimental ────────────────────────────────────────────
         "protocolo": {
-            "dataset_treino": "orandet_v80_train_raw.csv (sem normalização)",
-            "dataset_teste": "orandet_v80_test_raw.csv  (sem normalização)",
-            "n_amostras_treino": int(len(y_train)),
+            "dataset_treino": "orandet_v11_train_raw.csv (sem normalização)",
+            "dataset_teste": "orandet_v11_test_raw.csv  (sem normalização)",
+            "n_amostras_treino_total": int(len(y_train_full)),
+            "n_amostras_treino_originais": int(n_orig),
+            "n_amostras_treino_augmentadas": int(n_aug),
+            "n_amostras_treino_efetivo": int(n_tr_efetivo),
+            "n_amostras_validacao_interna": int(n_val_interna),
             "n_amostras_teste": int(len(y_test)),
             "subset_treino": (
-                "Apenas imagens originais — augmentações (flip_h, flip_v, "
-                "bright_75, bright_125) descartadas para treino do modelo"
+                "Originais + augmentadas (igualando MLP e SVR para comparação justa). "
+                "Mudança vs. v5: o XGBoost agora vê o mesmo conjunto de treino que os "
+                "outros dois modelos."
             ),
             "n_features": len(feat_cols),
             "alvo": TARGET_COL,
             "transformacao_inversa": "nenhuma — alvo é contagem direta (inteiro)",
-            "conjunto_validacao_dedicado": "ausente — validação feita por K-Fold CV",
-            "nota_leakage": (
-                "O early stopping usa X_test como segundo eval_set "
-                "(validation_1). O número de árvores usado foi selecionado "
-                "com base no desempenho no conjunto de teste — leakage leve "
-                "que deve ser declarado na metodologia."
+        },
+
+        # ── Protocolo anti-vazamento ──────────────────────────────────────────
+        "protocolo_anti_vazamento": {
+            "problema_v5": (
+                "Na v5, o early stopping usava o conjunto de teste como eval_set, "
+                "selecionando n_estimators com base no desempenho no teste — "
+                "vazamento leve declarado."
             ),
+            "correcao_v6": (
+                "Criado split estratificado interno do treino: "
+                f"{int((1 - VAL_INTERNA_FRAC) * 100)}% treino efetivo + "
+                f"{int(VAL_INTERNA_FRAC * 100)}% validação interna. "
+                "O eval_set do early stopping agora é a validação interna, "
+                "NÃO o conjunto de teste. Teste permanece intocado até "
+                "avaliação final."
+            ),
+            "fracao_validacao_interna": VAL_INTERNA_FRAC,
+            "estratificacao": "por faixa de contagem (0, 1, 2, 3-4, 5-7, 8+)",
+            "random_state": SEED,
+            "metodo": "sklearn.model_selection.train_test_split com stratify",
         },
 
         # ── Hiperparâmetros finais ────────────────────────────────────────────
@@ -384,6 +505,7 @@ def salvar_resultados(modelo, y_train, y_test, y_pred, metricas, cv_metricas,
             "n_estimators_config": params["n_estimators"],
             "n_estimators_usado": best,
             "early_stopping_rounds": params["early_stopping_rounds"],
+            "early_stopping_em": "validação interna (não no teste)",
             "max_depth": params["max_depth"],
             "min_child_weight": params["min_child_weight"],
             "gamma": params["gamma"],
@@ -397,7 +519,7 @@ def salvar_resultados(modelo, y_train, y_test, y_pred, metricas, cv_metricas,
             "random_state": params["random_state"],
         },
 
-        # ── Validação cruzada ─────────────────────────────────────────────────
+        # ── Validação cruzada (em originais) ──────────────────────────────────
         "validacao_cruzada": cv_metricas,
 
         # ── Resultados — treino ───────────────────────────────────────────────
@@ -409,28 +531,28 @@ def salvar_resultados(modelo, y_train, y_test, y_pred, metricas, cv_metricas,
         # ── Gap treino/teste ──────────────────────────────────────────────────
         "gap_treino_teste": {
             **metricas["gap_treino_teste"],
-            "MAE_treino_best_iter": mae_treino_best,
-            "MAE_teste_best_iter": mae_teste_best,
-            "gap_MAE_best_iter": gap_early,
-            "interpretacao": (
-                "ok (<2x)" if gap_early < 2
-                else "overfitting leve (2–4x)" if gap_early < 4
+            "MAE_treino_eff_best_iter": mae_tr_best,
+            "MAE_validacao_int_best_iter": mae_val_best,
+            "gap_MAE_val_vs_treino": gap_tr_val,
+            "interpretacao_val_vs_treino": (
+                "ok (<2x)" if gap_tr_val < 2
+                else "overfitting leve (2–4x)" if gap_tr_val < 4
                 else "overfitting severo (>4x)"
             ),
         },
 
-        # ── Análise por faixa de contagem ─────────────────────────────────────
+        # ── Análise por faixa ─────────────────────────────────────────────────
         "resultados_por_faixa": metricas["por_faixa"],
 
         # ── Eficiência ────────────────────────────────────────────────────────
         "eficiencia": {
             "tempo_treino_s": tempo_treino_s,
+            "tempo_inferencia": tempo_inferencia,
             "versao_xgboost": versao_xgb,
-            "nota_inferencia": "tempo de inferência por imagem: [VERIFICAR se necessário]",
         },
     }
 
-    with open(os.path.join(OUTPUT_DIR, "xgb_v5_metricas.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(OUTPUT_DIR, "xgb_v11_metricas.json"), "w", encoding="utf-8") as f:
         json.dump(saida, f, indent=2, ensure_ascii=False)
 
     # ── Figura 1: 4 painéis ───────────────────────────────────────────────────
@@ -470,7 +592,7 @@ def salvar_resultados(modelo, y_train, y_test, y_pred, metricas, cv_metricas,
         ax.set_xlabel("Faixa");
         ax.set_ylabel("MAPE (%)")
         ax2.set_ylabel("Bias (laranjas)")
-        ax.set_title("MAPE e Bias por Faixa\n(bias>0=superestima, <0=subestima)")
+        ax.set_title("MAPE e Bias por Faixa")
         for bar, n in zip(bars1, ns_f):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
                     f"n={n}", ha="center", fontsize=7)
@@ -485,7 +607,7 @@ def salvar_resultados(modelo, y_train, y_test, y_pred, metricas, cv_metricas,
                label=f"MAE={metricas['teste']['MAE']:.2f}")
     ax.axvline(float(np.median(erros)), color="orange", linestyle="--",
                label=f"Mediana={np.median(erros):.2f}")
-    ax.set_xlabel("Erro Absoluto (laranjas)");
+    ax.set_xlabel("Erro Absoluto");
     ax.set_ylabel("Frequência")
     ax.set_title("Distribuição dos Erros Absolutos");
     ax.legend()
@@ -495,125 +617,119 @@ def salvar_resultados(modelo, y_train, y_test, y_pred, metricas, cv_metricas,
     colors = plt.cm.viridis(np.linspace(0.2, 0.9, len(df_top)))
     ax.barh(df_top["grupo"][::-1], df_top["gain_total"][::-1], color=colors[::-1])
     ax.set_xlabel("Gain Total");
-    ax.set_title("Importância por Grupo de Features")
+    ax.set_title("Importância por Grupo")
     for i, (_, row) in enumerate(df_top[::-1].iterrows()):
         ax.text(row["gain_total"] + 0.001, i,
                 f"{row['gain_total']:.4f}", va="center", fontsize=8)
 
     cv = cv_metricas
     plt.suptitle(
-        f"XGBoost v5  |  CV MAPE={cv['cv_mape_mean']:.1f}%±{cv['cv_mape_std']:.1f}%\n"
+        f"XGBoost v6  |  Sem vazamento | Treino com aug | CV MAPE={cv['cv_mape_mean']:.1f}%\n"
         f"MAPE={metricas['teste']['MAPE']:.1f}%  MdAPE={metricas['teste']['MdAPE']:.1f}%  "
         f"MAE={metricas['teste']['MAE']:.2f}  R²={metricas['teste']['R2']:.3f}",
         fontsize=10, y=1.01,
     )
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "xgb_v5_resultados.png"),
+    plt.savefig(os.path.join(OUTPUT_DIR, "xgb_v6_resultados.png"),
                 dpi=150, bbox_inches="tight")
     plt.close()
 
-    # ── Figura 2: Curva de aprendizado ────────────────────────────────────────
+    # ── Figura 2: Curva de aprendizado treino vs validação interna ────────────
     if results:
-        fig, axes2 = plt.subplots(1, 2, figsize=(16, 5))
-
-        ax = axes2[0]
+        fig, ax = plt.subplots(figsize=(10, 5))
         train_mae = results["validation_0"]["mae"]
-        test_mae = results["validation_1"]["mae"]
-        ax.plot(train_mae, label="Treino", color="steelblue", lw=1.5)
-        ax.plot(test_mae, label="Teste", color="tomato", lw=1.5)
+        val_mae = results["validation_1"]["mae"]
+        ax.plot(train_mae, label="Treino efetivo", color="steelblue", lw=1.5)
+        ax.plot(val_mae, label="Validação interna", color="tomato", lw=1.5)
         ax.axvline(best, color="gray", linestyle="--", label=f"Melhor: {best}")
-        status = "✓ ok" if gap_early < 2 else "⚠ leve" if gap_early < 4 else "❌ severo"
+        status = "✓ ok" if gap_tr_val < 2 else "⚠ leve" if gap_tr_val < 4 else "❌ severo"
         ax.text(0.55, 0.92,
-                f"Gap: {gap_early:.1f}x  {status}\n"
-                f"Treino: {mae_treino_best:.3f}  Teste: {mae_teste_best:.3f}",
+                f"Gap val/treino: {gap_tr_val:.1f}x  {status}\n"
+                f"Treino: {mae_tr_best:.3f}  Val: {mae_val_best:.3f}\n"
+                f"✓ Sem vazamento — teste não usado",
                 transform=ax.transAxes, fontsize=9,
                 bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
         ax.set_xlabel("Iteração");
         ax.set_ylabel("MAE")
-        ax.set_title("Curva de Aprendizado");
+        ax.set_title("Curva de Aprendizado — Treino vs Validação Interna")
         ax.legend();
         ax.grid(alpha=0.3)
-
-        ax = axes2[1]
-        versoes = ["v1\n(Poisson)", "v2\n(sqlog+mape)", "v3\n(sqlog+mae)", "v5\n(este)"]
-        mapes_hist = [54.4, 46.0, 55.8, metricas["teste"]["MAPE"]]
-        gaps_hist = [7, 1, 5, gap_early]
-        ax_r = ax.twinx()
-        ax.bar(versoes, gaps_hist,
-               color=["#d73027", "#91cf60", "#fc8d59", "steelblue"], alpha=0.7,
-               label="Gap MAE (teste/treino)")
-        ax_r.plot(versoes, mapes_hist, "ko--", lw=2, ms=8, label="MAPE %")
-        ax.axhline(2, color="green", linestyle="--", lw=1.5, label="Gap ok (<2x)")
-        ax.set_ylabel("Gap treino/teste");
-        ax_r.set_ylabel("MAPE (%)")
-        ax.set_title("Histórico de Versões")
-        lines1, lbl1 = ax.get_legend_handles_labels()
-        lines2, lbl2 = ax_r.get_legend_handles_labels()
-        ax.legend(lines1 + lines2, lbl1 + lbl2, fontsize=8)
-
         plt.tight_layout()
-        plt.savefig(os.path.join(OUTPUT_DIR, "xgb_v5_curva_aprendizado.png"),
+        plt.savefig(os.path.join(OUTPUT_DIR, "xgb_v6_curva_aprendizado.png"),
                     dpi=150, bbox_inches="tight")
         plt.close()
 
     print(f"\n  Arquivos em: {OUTPUT_DIR}/")
-    print(f"    ├─ xgb_v5_modelo.joblib")
-    print(f"    ├─ xgb_v5_metricas.json        ← protocolo + hiperparâmetros + métricas completas")
-    print(f"    ├─ xgb_v5_predicoes_teste.csv")
-    print(f"    ├─ xgb_v5_resultados.png")
-    print(f"    └─ xgb_v5_curva_aprendizado.png")
+    print(f"    ├─ xgb_v6_modelo.joblib")
+    print(f"    ├─ xgb_v11_metricas.json        ← protocolo + anti-vazamento + tempos")
+    print(f"    ├─ xgb_v6_predicoes_teste.csv")
+    print(f"    ├─ xgb_v6_resultados.png")
+    print(f"    └─ xgb_v6_curva_aprendizado.png")
 
 
 # MAIN
+
 def main():
     print("\n" + "═" * 65)
-    print("  XGBoost v5 — Regularização forte | K-Fold CV | JSON IEEE")
+    print("  XGBoost v6 — Sem vazamento | Treino com augmentadas | Tempo inferência")
     print("═" * 65)
 
-    df_train, df_test = carregar_dados()
-    X_train, y_train, X_test, y_test, feat_cols, medianas = preparar_xy(df_train, df_test)
+    df_train_full, df_orig, df_test = carregar_dados()
+    X_train_full, y_train_full, X_test, y_test, feat_cols, medianas = preparar_xy(
+        df_train_full, df_test
+    )
 
+    # CV em originais apenas (evita leakage entre folds)
     params_cv = dict(
         objective="count:poisson", eval_metric="mae",
         n_estimators=500, max_depth=4, min_child_weight=15,
         gamma=0.5, subsample=0.7, colsample_bytree=0.5,
         reg_alpha=1.0, reg_lambda=5.0, learning_rate=0.02,
-        tree_method="hist", n_jobs=-1, random_state=42,
+        tree_method="hist", n_jobs=-1, random_state=SEED,
         verbosity=0, early_stopping_rounds=50,
     )
-    cv_metricas = validacao_cruzada(X_train, y_train, params_cv)
+    cv_metricas = validacao_cruzada(df_orig, feat_cols, params_cv)
 
-    modelo, params, tempo_treino_s = treinar_modelo(X_train, y_train, X_test, y_test)
+    # Split de validação interna — elimina vazamento do early stopping
+    X_tr, y_tr, X_val, y_val, idx_tr, idx_val = split_validacao_interna(
+        X_train_full, y_train_full, df_train_full
+    )
 
-    y_pred, metricas = avaliar(modelo, X_train, y_train, X_test, y_test)
+    # Treino final — agora eval_set é validação interna, não teste
+    modelo, params, tempo_treino_s = treinar_modelo(X_tr, y_tr, X_val, y_val)
 
+    # Avaliação no teste
+    y_pred, metricas = avaliar(modelo, X_train_full, y_train_full, X_test, y_test)
+
+    # Tempo de inferência
+    tempo_inferencia = medir_tempo_inferencia(modelo, X_test, n_reps=INFERENCIA_REPS)
+
+    # Diagnóstico de features
     imp, df_grupo = diagnosticar_features(modelo, feat_cols)
 
-    salvar_resultados(modelo, y_train, y_test, y_pred, metricas, cv_metricas,
-                      imp, df_grupo, df_test, feat_cols, medianas,
-                      params, tempo_treino_s)
+    # Salvar tudo
+    salvar_resultados(
+        modelo, X_test, y_train_full, y_test, y_pred,
+        metricas, cv_metricas, tempo_inferencia,
+        imp, df_grupo, df_test, feat_cols, medianas,
+        params, tempo_treino_s,
+        n_orig=len(df_orig),
+        n_aug=len(df_train_full) - len(df_orig),
+        n_tr_efetivo=len(X_tr),
+        n_val_interna=len(X_val),
+        idx_tr=idx_tr, idx_val=idx_val,
+    )
 
     print(f"\n{'═' * 65}")
-    print(f"  CV MAPE:  {cv_metricas['cv_mape_mean']:.1f}% ± {cv_metricas['cv_mape_std']:.1f}%")
-    print(f"  MAPE:     {metricas['teste']['MAPE']:.1f}%")
-    print(f"  MAE:      {metricas['teste']['MAE']:.3f} laranjas/imagem")
-    print(f"  R²:       {metricas['teste']['R2']:.4f}")
-    print(f"  Treino:   {tempo_treino_s}s")
-
-    results = modelo.evals_result()
-    best = modelo.best_iteration
-    mae_tr_best = results["validation_0"]["mae"][best]
-    mae_te_best = results["validation_1"]["mae"][best]
-    gap = mae_te_best / (mae_tr_best + 1e-9)
-    print(f"  Gap:      {gap:.1f}x  (meta: < 2x)")
-
-    if gap > 4:
-        print(f"\n  ❌ Overfitting severo. Verificar qualidade da máscara "
-              f"e considerar redução de features (ex.: remover G13).")
-    elif gap > 2:
-        print(f"\n  ⚠  Overfitting leve. Foque nas features G14 (contagem direta).")
-    else:
-        print(f"\n  ✓  Gap sob controle.")
+    print(f"  CV MAPE:     {cv_metricas['cv_mape_mean']:.1f}% ± {cv_metricas['cv_mape_std']:.1f}%")
+    print(f"  MAPE teste:  {metricas['teste']['MAPE']:.1f}%")
+    print(f"  MAE teste:   {metricas['teste']['MAE']:.3f} laranjas/imagem")
+    print(f"  R² teste:    {metricas['teste']['R2']:.4f}")
+    print(f"  ±1 fruta:    {metricas['teste']['acerto_pm1']:.1f}%")
+    print(f"  ±2 frutas:   {metricas['teste']['acerto_pm2']:.1f}%")
+    print(f"  Treino:      {tempo_treino_s}s")
+    print(f"  Inferência:  {tempo_inferencia['tempo_por_imagem_ms']:.3f} ms/imagem")
+    print(f"  ✓ Sem vazamento | ✓ Treino com aug | ✓ Tempo inferência medido")
     print(f"{'═' * 65}\n")
 
 

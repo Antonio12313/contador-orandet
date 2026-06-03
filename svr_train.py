@@ -17,27 +17,33 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 warnings.filterwarnings("ignore")
 
 # CONFIGURAÇÃO
-DATASET_DIR = "dataset_preparado_v80"
-OUTPUT_DIR = "./resultados_svr_v2"
+DATASET_DIR = "dataset_preparado_v11"
+OUTPUT_DIR = "./resultados_svr_v11"
 
-# corrigido: era orandet_v71_*_norm.csv
-TRAIN_CSV = os.path.join(DATASET_DIR, "orandet_v80_train_norm.csv")
-TEST_CSV = os.path.join(DATASET_DIR, "orandet_v80_test_norm.csv")
+TRAIN_CSV = os.path.join(DATASET_DIR, "orandet_v11_train_norm.csv")
+TEST_CSV = os.path.join(DATASET_DIR, "orandet_v11_test_norm.csv")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# corrigido: removidos contagem_log e contagem_total (não existem no v80)
 COLUNAS_META = [
     "image_id", "file_name", "split",
     "contagem", "contagem_log1p", "contagem_sqrt", "augmentacao",
 ]
 
-# corrigido: target é contagem_log1p para SVR (dados normalizados)
-# transformação inversa: np.expm1(pred)
 TARGET_COL = "contagem_log1p"
-TARGET_INVERSA = "expm1"  # registrado no JSON
+TARGET_INVERSA = "expm1"
+
+# Repetições da medição de tempo de inferência — alinhado com XGBoost (N=10)
+INFERENCIA_REPS = 10
 
 K_FEATURES_PADRAO = 160
+
+# ─── FAIXAS DE CONTAGEM ────────────────────────────────────────────────────────
+# Convenção dos três JSON de resultados: [1], [2], [3-4], [5-7], [8+]
+# A faixa [0] é mantida internamente para diagnóstico, mas não entra na
+# tabela comparativa entre modelos (alinhamento com XGBoost e MLP).
+FAIXAS_DEF = [(0, 0), (1, 1), (2, 2), (3, 4), (5, 7), (8, 999)]
+FAIXAS_LABEL = ["0", "1", "2", "3-4", "5-7", "8+"]
 
 
 # 1. CARREGAMENTO
@@ -51,17 +57,14 @@ def carregar_dados():
     feat_cols = [c for c in df_train_full.columns if c not in COLUNAS_META]
     print(f"  Treino (com aug): {len(df_train_full)} amostras")
     print(f"  Teste:            {len(df_test)} amostras")
-    print(f"  Features:         {len(feat_cols)}")
+    print(f"  Features entrada: {len(feat_cols)}")
     print(f"  Target:           {TARGET_COL}  (inversa: {TARGET_INVERSA})")
 
     X_train = df_train_full[feat_cols].values
     y_train = df_train_full[TARGET_COL].values.astype(np.float64)
     X_test = df_test[feat_cols].values
-    # y_test em escala original para avaliação
-    y_test = df_test["contagem"].values.astype(np.float64)
-    # y_test transformado para comparar com predição antes da inversa
-    y_test_t = df_test[TARGET_COL].values.astype(np.float64)
-
+    y_test = df_test["contagem"].values.astype(np.float64)  # escala original
+    y_test_t = df_test[TARGET_COL].values.astype(np.float64)  # escala log1p
     meta_test = df_test[["image_id", "file_name", "contagem"]].copy()
 
     print(f"\n  Distribuição (treino — originais):")
@@ -72,7 +75,6 @@ def carregar_dados():
     print(f"    min={df_test['contagem'].min():.0f}  max={df_test['contagem'].max():.0f}"
           f"  média={df_test['contagem'].mean():.1f}  mediana={df_test['contagem'].median():.1f}")
 
-    # Sanity check NaN/Inf
     nan_tr = np.isnan(X_train).sum() + np.isinf(X_train).sum()
     nan_te = np.isnan(X_test).sum() + np.isinf(X_test).sum()
     if nan_tr > 0 or nan_te > 0:
@@ -94,7 +96,7 @@ def construir_pipeline(k_features=K_FEATURES_PADRAO):
     ])
 
 
-# 3. GRID SEARCH — somente em originais para evitar leakage de CV
+# 3. GRID SEARCH — apenas originais para evitar leakage de CV entre augmentações
 
 def _candidatos_k(n_features):
     candidatos = [80, 120, 160, 240, 320]
@@ -105,7 +107,6 @@ def _candidatos_k(n_features):
 def grid_search(pipeline, X_train, y_train):
     print("\n[3/6] Grid Search com validação cruzada (5-fold, random_state=42)...")
 
-    # Grid search somente em originais — evita leakage entre augmentações
     df_train_full = pd.read_csv(TRAIN_CSV)
     df_orig = df_train_full[df_train_full["augmentacao"] == "original"].copy()
     feat_cols = [c for c in df_orig.columns if c not in COLUNAS_META]
@@ -115,7 +116,6 @@ def grid_search(pipeline, X_train, y_train):
     n_features = X_train.shape[1]
     candidatos_k = _candidatos_k(n_features)
 
-    # grade completa — registrada no JSON para reprodutibilidade
     param_grid = [
         {
             "selector__k": candidatos_k,
@@ -131,7 +131,8 @@ def grid_search(pipeline, X_train, y_train):
             "svr__epsilon": [0.5, 1.0, 2.0],
         },
         {
-            "selector__k": [k for k in candidatos_k if k <= max(80, n_features // 2)] or candidatos_k[:2],
+            "selector__k": [k for k in candidatos_k if k <= max(80, n_features // 2)]
+                           or candidatos_k[:2],
             "svr__kernel": ["poly"],
             "svr__C": [1, 10],
             "svr__epsilon": [0.5, 1.0],
@@ -153,7 +154,7 @@ def grid_search(pipeline, X_train, y_train):
     )
 
     print(f"  Grid Search em {len(X_orig)} amostras originais (sem augmentadas)")
-    print(f"  Target: {TARGET_COL}  |  Candidatos k: {candidatos_k}\n")
+    print(f"  Scoring: neg_MAE em escala log1p  |  Candidatos k: {candidatos_k}\n")
 
     _t0 = time.perf_counter()
     gs.fit(X_orig, y_orig)
@@ -180,14 +181,52 @@ def treino_final(gs, X_train, y_train):
     return melhor_pipeline, tempo_treino
 
 
-# 5. AVALIAÇÃO
+# 5. AVALIAÇÃO — inclui tempo de inferência por imagem (NOVO)
+
+def _medir_inferencia(modelo, X_test, n_repeticoes=INFERENCIA_REPS):
+    """
+    Mede o tempo médio de inferência por imagem.
+    Faz n_repeticoes passagens completas pelo conjunto de teste e
+    retorna a mediana (mais robusta a jitter do sistema).
+    Metodologia alinhada à do XGBoost (N=10) para comparação direta.
+
+    Retorna
+    -------
+    tempo_por_imagem_ms : float
+        Mediana do tempo de inferência por imagem, em milissegundos.
+    tempo_total_ms : float
+        Tempo total para processar todo o conjunto de teste (1 passagem).
+    """
+    n = len(X_test)
+
+    # warmup — evita penalidade de inicialização na primeira chamada
+    _ = modelo.predict(X_test[:min(5, n)])
+
+    tempos = []
+    for _ in range(n_repeticoes):
+        t0 = time.perf_counter()
+        modelo.predict(X_test)
+        tempos.append(time.perf_counter() - t0)
+
+    mediana_total_s = float(np.median(tempos))
+    por_imagem_ms = round(mediana_total_s / n * 1000, 4)
+    total_ms = round(mediana_total_s * 1000, 2)
+
+    print(f"\n  Tempo de inferência (mediana de {n_repeticoes} passes):")
+    print(f"    Total ({n} imgs):  {total_ms:.2f} ms")
+    print(f"    Por imagem:        {por_imagem_ms:.4f} ms")
+
+    return por_imagem_ms, total_ms
+
 
 def avaliar(modelo, X_train, y_train_log, X_test, y_test, y_test_log, meta_test):
     print("\n[5/6] Avaliando...")
 
+    # ── Tempo de inferência por imagem ────────────────────────────────────────
+    tempo_inf_por_img_ms, tempo_inf_total_ms = _medir_inferencia(modelo, X_test)
+
     # ── Predição no teste ─────────────────────────────────────────────────────
     y_pred_log = modelo.predict(X_test)
-    # transformação inversa: expm1
     y_pred = np.clip(np.expm1(y_pred_log), 0, None)
     y_pred_int = np.round(y_pred).astype(int)
 
@@ -195,7 +234,6 @@ def avaliar(modelo, X_train, y_train_log, X_test, y_test, y_test_log, meta_test)
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     r2 = r2_score(y_test, y_pred)
 
-    # MAPE: consistente com XGBoost — apenas amostras com y > 0
     mask = y_test > 0
     mape = float(np.mean(np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])) * 100)
     mdape = float(np.median(np.abs((y_test[mask] - y_pred[mask]) / y_test[mask])) * 100)
@@ -207,7 +245,6 @@ def avaliar(modelo, X_train, y_train_log, X_test, y_test, y_test_log, meta_test)
     # ── Predição no treino (gap) ──────────────────────────────────────────────
     y_pred_tr_log = modelo.predict(X_train)
     y_pred_tr = np.clip(np.expm1(y_pred_tr_log), 0, None)
-    # reconstruir y_train escala original
     y_train_orig = np.expm1(y_train_log)
 
     mae_tr = mean_absolute_error(y_train_orig, y_pred_tr)
@@ -229,16 +266,18 @@ def avaliar(modelo, X_train, y_train_log, X_test, y_test, y_test_log, meta_test)
     print(f"  ±1 fruta:           {dentro_1:.1f}%")
     print(f"  ±2 frutas:          {dentro_2:.1f}%")
     print(f"  Dentro de 20%:      {dentro_20:.1f}%")
+    print(f"  Inf. por imagem:    {tempo_inf_por_img_ms:.4f} ms")
 
-    # ── Análise por faixa — consistente com XGBoost ───────────────────────────
-    # corrigido: faixas reais do dataset (0–12 laranjas aprox.)
+    # ── Análise por faixa ─────────────────────────────────────────────────────
+    # Convenção idêntica à dos outros dois modelos: [1],[2],[3-4],[5-7],[8+]
+    # A faixa [0] é incluída apenas para diagnóstico — não entra na tabela
+    # comparativa entre modelos (não é ponto de comparação entre SVR/MLP/XGB).
     print(f"\n  MAPE por faixa:")
     print(f"  {'Faixa':<8} {'N':>5} {'MAE':>6} {'MAPE%':>7} {'±1':>7} {'Bias':>7}")
     print(f"  {'─' * 42}")
-    faixas_def = [(0, 0), (1, 1), (2, 2), (3, 4), (5, 7), (8, 999)]
-    faixas_label = ["0", "1", "2", "3-4", "5-7", "8+"]
+
     metricas_f = []
-    for (lo, hi), label in zip(faixas_def, faixas_label):
+    for (lo, hi), label in zip(FAIXAS_DEF, FAIXAS_LABEL):
         idx = (y_test >= lo) & (y_test <= hi)
         n = idx.sum()
         if n == 0:
@@ -252,9 +291,12 @@ def avaliar(modelo, X_train, y_train_log, X_test, y_test, y_test_log, meta_test)
         flag = " ← PROBLEMA" if mape_f > 60 else ""
         print(f"  {label:<8} {n:>5} {mae_f:>6.2f} {mape_f:>6.1f}%  {a1:>5.1f}%  {bias:>+6.2f}{flag}")
         metricas_f.append({
-            "faixa": label, "n": int(n),
-            "mae": round(mae_f, 3), "mape": round(mape_f, 1),
-            "acerto_pm1": round(a1, 1), "bias": round(bias, 3),
+            "faixa": label,
+            "n": int(n),
+            "mae": round(mae_f, 3),
+            "mape": round(mape_f, 1),
+            "acerto_pm1": round(a1, 1),
+            "bias": round(bias, 3),
         })
 
     resultado = meta_test.copy().reset_index(drop=True)
@@ -265,8 +307,10 @@ def avaliar(modelo, X_train, y_train_log, X_test, y_test, y_test_log, meta_test)
 
     metricas = {
         "treino": {
-            "MAE": round(mae_tr, 4), "RMSE": round(rmse_tr, 4),
-            "R2": round(r2_tr, 4), "MAPE": round(mape_tr, 2),
+            "MAE": round(mae_tr, 4),
+            "RMSE": round(rmse_tr, 4),
+            "R2": round(r2_tr, 4),
+            "MAPE": round(mape_tr, 2),
         },
         "teste": {
             "MAE": round(mae, 4),
@@ -285,6 +329,11 @@ def avaliar(modelo, X_train, y_train_log, X_test, y_test, y_test_log, meta_test)
             "R2_delta": round(r2 - r2_tr, 4),
         },
         "por_faixa": metricas_f,
+        # tempos para uso na seção eficiência do JSON
+        "_inferencia_ms": {
+            "por_imagem": tempo_inf_por_img_ms,
+            "total_teste": tempo_inf_total_ms,
+        },
     }
     return resultado, metricas
 
@@ -305,7 +354,6 @@ def analisar_features(modelo, feat_cols):
     for nome, score in feats_sel[:20]:
         print(f"    {nome:<45} F={score:.1f}")
 
-    # corrigido: grupos atualizados para v80 (G15, G16, fft, spatial, derivadas)
     grupos = {
         "G1_hsv": ["hsv_"],
         "G2_rgb_lab_ycbcr": ["rgb_", "lab_", "ycbcr_"],
@@ -341,32 +389,30 @@ def analisar_features(modelo, feat_cols):
     return feats_sel, grupo_counts
 
 
-# 7. SALVAMENTO — JSON completo para reprodutibilidade IEEE
+# 7. SALVAMENTO
 
 def salvar(modelo, gs, param_grid, candidatos_k, resultado, metricas,
            feats_sel, grupo_counts, feat_cols,
            tempo_gs, tempo_treino):
     print("\n[6/6] Salvando artefatos...")
 
-    joblib.dump(modelo, os.path.join(OUTPUT_DIR, "svr_v2_modelo.joblib"))
-    resultado.to_csv(os.path.join(OUTPUT_DIR, "svr_v2_predicoes_teste.csv"), index=False)
+    joblib.dump(modelo, os.path.join(OUTPUT_DIR, "svr_v3_modelo.joblib"))
+    resultado.to_csv(os.path.join(OUTPUT_DIR, "svr_v3_predicoes_teste.csv"), index=False)
 
     df_feats = pd.DataFrame(feats_sel, columns=["feature", "f_score"])
-    df_feats.to_csv(os.path.join(OUTPUT_DIR, "svr_v2_features_selecionadas.csv"), index=False)
+    df_feats.to_csv(os.path.join(OUTPUT_DIR, "svr_v3_features_selecionadas.csv"), index=False)
 
     df_gs = pd.DataFrame(gs.cv_results_)
     df_gs.sort_values("rank_test_score").to_csv(
-        os.path.join(OUTPUT_DIR, "svr_v2_grid_search_resultados.csv"), index=False
+        os.path.join(OUTPUT_DIR, "svr_v3_grid_search_resultados.csv"), index=False
     )
 
-    # ── versão do sklearn ─────────────────────────────────────────────────────
     try:
         versao_sklearn = importlib.metadata.version("scikit-learn")
     except Exception:
         import sklearn
         versao_sklearn = sklearn.__version__
 
-    # ── CV detalhado por fold ─────────────────────────────────────────────────
     cv_results = gs.cv_results_
     best_idx = gs.best_index_
     cv_por_fold = []
@@ -378,27 +424,56 @@ def salvar(modelo, gs, param_grid, candidatos_k, resultado, metricas,
                 "mae_log": round(float(-cv_results[chave][best_idx]), 4),
             })
 
-    mae_cv_scores = [-cv_results[f"split{f}_test_score"][best_idx] for f in range(5)
+    mae_cv_scores = [-cv_results[f"split{f}_test_score"][best_idx]
+                     for f in range(5)
                      if f"split{f}_test_score" in cv_results]
 
-    # ── JSON ──────────────────────────────────────────────────────────────────
+    # ── extrair tempos de inferência salvos em metricas ───────────────────────
+    inf = metricas.pop("_inferencia_ms")  # remove da estrutura interna
+
+    # ── dados de treino para o JSON ───────────────────────────────────────────
+    df_tr = pd.read_csv(TRAIN_CSV)
+    n_treino_total = int(len(df_tr))
+    n_treino_originais = int(len(df_tr[df_tr["augmentacao"] == "original"]))
+
     saida = {
 
         # ── Protocolo ─────────────────────────────────────────────────────────
         "protocolo": {
-            "dataset_treino": "orandet_v80_train_norm.csv (normalizado [0,1])",
-            "dataset_teste": "orandet_v80_test_norm.csv  (normalizado [0,1])",
-            "n_amostras_treino": int(len(resultado) * 0),  # placeholder — ver abaixo
-            "n_amostras_teste": int(len(resultado)),
-            "subset_gridsearch": "Apenas originais (sem augmentadas) — evita leakage de CV",
-            "treino_final": "Originais + augmentadas",
+            "dataset_treino": "orandet_v11_train_norm.csv (normalizado)",
+            "dataset_teste": "orandet_v11_test_norm.csv  (normalizado)",
+            "n_amostras_treino": n_treino_total,
+            "n_amostras_treino_originais": n_treino_originais,
+            # NOVO: declaração explícita para comparação entre modelos
+            "n_amostras_treino_gridsearch": n_treino_originais,
+            "n_amostras_teste": 306,
+            "treino_final": "Originais + augmentadas (todas as amostras de treino)",
             "n_features_entrada": len(feat_cols),
+            # NOVO: n_features_selecionadas é o k escolhido pelo GridSearch
             "n_features_selecionadas": len(feats_sel),
+            "nota_features": (
+                f"DIFERENÇA DE PIPELINE: o SVR opera em um espaço de features "
+                f"REDUZIDO de {len(feats_sel)} features (via SelectKBest com "
+                f"f_regression), enquanto XGBoost e MLP usam as {len(feat_cols)} "
+            ),
             "alvo_modelo": TARGET_COL,
-            "transformacao_inversa": "np.expm1(pred) — converte log1p para escala original",
-            "avaliacao_escala": "contagem direta (inteiro) após expm1",
-            "normalizacao": "MinMaxScaler [0,1] ajustado no treino (orandet_v80_scaler.joblib)",
-            "conjunto_validacao_dedicado": "ausente — validação por GridSearchCV 5-fold",
+        },
+
+        # ── Integridade / Leakage ─────────────────────────────────────────────
+        # NOVO: seção explícita para auditoria e comparação com XGBoost
+        "integridade_experimento": {
+            "leakage_teste_no_cv": False,
+            "descricao": (
+                "O conjunto de teste NÃO foi usado em nenhum momento "
+                "durante a busca de hiperparâmetros (GridSearchCV usa apenas "
+                "as amostras originais de treino)"
+            ),
+            "comparabilidade_cv_entre_modelos": (
+                "NÃO comparável diretamente: "
+                "MLP otimizou MAPE na escala original; "
+                "SVR otimizou MAE na escala log1p; "
+                "Os CVs servem para diagnóstico interno de cada modelo."
+            ),
         },
 
         # ── Pipeline ──────────────────────────────────────────────────────────
@@ -408,10 +483,10 @@ def salvar(modelo, gs, param_grid, candidatos_k, resultado, metricas,
             "nota": "SelectKBest usa correlação linear (F-test) como critério de seleção",
         },
 
-        # ── Hiperparâmetros e grade completa ──────────────────────────────────
+        # ── Hiperparâmetros ───────────────────────────────────────────────────
         "hiperparametros_finais": {
             **gs.best_params_,
-            "random_state_cv": 42,  # KFold do GridSearchCV — não existe random_state no SVR
+            "random_state_cv": 42,
         },
         "grade_busca": {
             "candidatos_k": candidatos_k,
@@ -432,20 +507,28 @@ def salvar(modelo, gs, param_grid, candidatos_k, resultado, metricas,
             "mae_cv_mean_log": round(float(-gs.best_score_), 4),
             "mae_cv_std_log": round(float(np.std(mae_cv_scores)), 4) if mae_cv_scores else None,
             "por_fold_log": cv_por_fold,
-            "nota": "MAE em escala log1p — não comparável diretamente com MAE do XGBoost",
+            "nota_escala": (
+                "MAE em escala log1p — não comparável com MAE do XGBoost "
+                "(escala original) nem com MAPE do MLP. "
+                "Ver campo integridade_experimento.comparabilidade_cv_entre_modelos."
+            ),
         },
 
-        # ── Resultados treino ─────────────────────────────────────────────────
+        # ── Resultados ────────────────────────────────────────────────────────
         "resultados_treino": metricas["treino"],
-
-        # ── Resultados teste ──────────────────────────────────────────────────
         "resultados_teste": metricas["teste"],
-
-        # ── Gap treino/teste ──────────────────────────────────────────────────
         "gap_treino_teste": metricas["gap_treino_teste"],
 
         # ── Por faixa ─────────────────────────────────────────────────────────
+        # Convenção: [1],[2],[3-4],[5-7],[8+] — alinhada com XGBoost e MLP
+        # A faixa [0] aparece apenas para diagnóstico interno.
         "resultados_por_faixa": metricas["por_faixa"],
+        "nota_faixas": (
+            "Faixas [1],[2],[3-4],[5-7],[8+] — convenção adotada nos três modelos. "
+            "Faixa [0] incluída apenas para diagnóstico; "
+            "viés sistemático esperado: superestimação em [1] e subestimação em [8+] "
+            "(regressão à média)."
+        ),
 
         # ── Features ─────────────────────────────────────────────────────────
         "features": {
@@ -456,32 +539,31 @@ def salvar(modelo, gs, param_grid, candidatos_k, resultado, metricas,
         },
 
         # ── Eficiência ────────────────────────────────────────────────────────
+        # NOVO: tempo de inferência por imagem (mediana de 5 passes, com warmup)
         "eficiencia": {
             "tempo_grid_search_s": tempo_gs,
             "tempo_treino_final_s": tempo_treino,
+            "inferencia_por_imagem_ms": inf["por_imagem"],
+            "inferencia_total_teste_ms": inf["total_teste"],
+            "n_imagens_teste": 306,
+            "metodo_medicao_inferencia": (
+                f"mediana de {INFERENCIA_REPS} passagens completas pelo conjunto "
+                "de teste, com warmup de 5 amostras antes das medições "
+                "(N alinhado com o XGBoost para comparação direta)"
+            ),
             "versao_sklearn": versao_sklearn,
         },
     }
 
-    # corrigir n_amostras_treino (não tínhamos X_train aqui, usamos o CSV)
-    df_tr = pd.read_csv(TRAIN_CSV)
-    saida["protocolo"]["n_amostras_treino"] = int(len(df_tr))
-    saida["protocolo"]["n_amostras_treino_originais"] = int(
-        len(df_tr[df_tr["augmentacao"] == "original"])
-    )
-    saida["protocolo"]["n_amostras_treino_gridsearch"] = int(
-        len(df_tr[df_tr["augmentacao"] == "original"])
-    )
-
-    with open(os.path.join(OUTPUT_DIR, "svr_v2_relatorio.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(OUTPUT_DIR, "svr_v11_relatorio.json"), "w", encoding="utf-8") as f:
         json.dump(saida, f, indent=2, ensure_ascii=False)
 
     print(f"  Arquivos em: {OUTPUT_DIR}/")
-    print(f"    ├─ svr_v2_modelo.joblib")
-    print(f"    ├─ svr_v2_relatorio.json          ← protocolo + grade + métricas completas")
-    print(f"    ├─ svr_v2_predicoes_teste.csv")
-    print(f"    ├─ svr_v2_features_selecionadas.csv")
-    print(f"    └─ svr_v2_grid_search_resultados.csv")
+    print(f"    ├─ svr_v3_modelo.joblib")
+    print(f"    ├─ svr_v11_relatorio.json")
+    print(f"    ├─ svr_v3_predicoes_teste.csv")
+    print(f"    ├─ svr_v3_features_selecionadas.csv")
+    print(f"    └─ svr_v3_grid_search_resultados.csv")
 
     return saida
 
@@ -489,11 +571,9 @@ def salvar(modelo, gs, param_grid, candidatos_k, resultado, metricas,
 # MAIN
 
 def main():
-    print("\n" + "═" * 65)
-    print("  SVR v2 — CONTAGEM DE LARANJAS | OranDet v80")
+    print("  SVR v3 — CONTAGEM DE LARANJAS | OranDet v11")
     print("  Pipeline: SelectKBest(f_regression) → SVR")
     print("  Target: contagem_log1p  |  Inversa: expm1")
-    print("═" * 65)
 
     X_train, y_train, X_test, y_test, y_test_log, meta_test, feat_cols = carregar_dados()
 
@@ -524,17 +604,20 @@ def main():
     print(f"  Melhores hiperparâmetros:")
     for k, v in gs.best_params_.items():
         print(f"    {k:<25} = {v}")
-    print(f"\n  MAE CV (log1p):     {-gs.best_score_:.4f}")
-    print(f"  MAE teste:          {metricas['teste']['MAE']:.4f} laranjas/img")
-    print(f"  RMSE teste:         {metricas['teste']['RMSE']:.4f}")
-    print(f"  R² teste:           {metricas['teste']['R2']:.4f}")
-    print(f"  MAPE teste:         {metricas['teste']['MAPE']:.1f}%")
-    print(f"  MdAPE teste:        {metricas['teste']['MdAPE']:.1f}%")
-    print(f"  ±1 fruta:           {metricas['teste']['acerto_pm1']:.1f}%")
-    print(f"  ±2 frutas:          {metricas['teste']['acerto_pm2']:.1f}%")
-    print(f"  Gap MAE ratio:      {metricas['gap_treino_teste']['MAE_ratio']:.2f}x")
-    print(f"  Tempo GS:           {tempo_gs}s")
-    print(f"  Tempo treino final: {tempo_treino}s")
+    print(f"\n  MAE CV (log1p):         {-gs.best_score_:.4f}")
+    print(f"  MAE treino:             {metricas['treino']['MAE']:.4f} laranjas/img")
+    print(f"  MAE teste:              {metricas['teste']['MAE']:.4f} laranjas/img")
+    print(f"  RMSE teste:             {metricas['teste']['RMSE']:.4f}")
+    print(f"  R² teste:               {metricas['teste']['R2']:.4f}")
+    print(f"  MAPE teste:             {metricas['teste']['MAPE']:.1f}%")
+    print(f"  MdAPE teste:            {metricas['teste']['MdAPE']:.1f}%")
+    print(f"  ±1 fruta:               {metricas['teste']['acerto_pm1']:.1f}%")
+    print(f"  ±2 frutas:              {metricas['teste']['acerto_pm2']:.1f}%")
+    print(f"  Gap MAE ratio:          {metricas['gap_treino_teste']['MAE_ratio']:.2f}x")
+    infer = relatorio["eficiencia"]
+    print(f"  Inf. por imagem:        {infer['inferencia_por_imagem_ms']:.4f} ms")
+    print(f"  Tempo GS:               {tempo_gs}s")
+    print(f"  Tempo treino final:     {tempo_treino}s")
     print(f"{'═' * 65}\n")
 
 
