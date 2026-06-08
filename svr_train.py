@@ -33,15 +33,10 @@ COLUNAS_META = [
 TARGET_COL = "contagem_log1p"
 TARGET_INVERSA = "expm1"
 
-# Repetições da medição de tempo de inferência — alinhado com XGBoost (N=10)
 INFERENCIA_REPS = 10
 
 K_FEATURES_PADRAO = 160
 
-# ─── FAIXAS DE CONTAGEM ────────────────────────────────────────────────────────
-# Convenção dos três JSON de resultados: [1], [2], [3-4], [5-7], [8+]
-# A faixa [0] é mantida internamente para diagnóstico, mas não entra na
-# tabela comparativa entre modelos (alinhamento com XGBoost e MLP).
 FAIXAS_DEF = [(0, 0), (1, 1), (2, 2), (3, 4), (5, 7), (8, 999)]
 FAIXAS_LABEL = ["0", "1", "2", "3-4", "5-7", "8+"]
 
@@ -87,7 +82,6 @@ def carregar_dados():
     return X_train, y_train, X_test, y_test, y_test_t, meta_test, feat_cols
 
 
-# 2. PIPELINE
 
 def construir_pipeline(k_features=K_FEATURES_PADRAO):
     return Pipeline([
@@ -96,7 +90,6 @@ def construir_pipeline(k_features=K_FEATURES_PADRAO):
     ])
 
 
-# 3. GRID SEARCH — apenas originais para evitar leakage de CV entre augmentações
 
 def _candidatos_k(n_features):
     candidatos = [80, 120, 160, 240, 320]
@@ -167,7 +160,6 @@ def grid_search(pipeline, X_train, y_train):
     return gs, param_grid, candidatos_k, tempo_gs
 
 
-# 4. TREINO FINAL
 
 def treino_final(gs, X_train, y_train):
     print("\n[4/6] Treino final (originais + augmentadas)...")
@@ -181,22 +173,8 @@ def treino_final(gs, X_train, y_train):
     return melhor_pipeline, tempo_treino
 
 
-# 5. AVALIAÇÃO — inclui tempo de inferência por imagem (NOVO)
 
 def _medir_inferencia(modelo, X_test, n_repeticoes=INFERENCIA_REPS):
-    """
-    Mede o tempo médio de inferência por imagem.
-    Faz n_repeticoes passagens completas pelo conjunto de teste e
-    retorna a mediana (mais robusta a jitter do sistema).
-    Metodologia alinhada à do XGBoost (N=10) para comparação direta.
-
-    Retorna
-    -------
-    tempo_por_imagem_ms : float
-        Mediana do tempo de inferência por imagem, em milissegundos.
-    tempo_total_ms : float
-        Tempo total para processar todo o conjunto de teste (1 passagem).
-    """
     n = len(X_test)
 
     # warmup — evita penalidade de inicialização na primeira chamada
@@ -268,10 +246,6 @@ def avaliar(modelo, X_train, y_train_log, X_test, y_test, y_test_log, meta_test)
     print(f"  Dentro de 20%:      {dentro_20:.1f}%")
     print(f"  Inf. por imagem:    {tempo_inf_por_img_ms:.4f} ms")
 
-    # ── Análise por faixa ─────────────────────────────────────────────────────
-    # Convenção idêntica à dos outros dois modelos: [1],[2],[3-4],[5-7],[8+]
-    # A faixa [0] é incluída apenas para diagnóstico — não entra na tabela
-    # comparativa entre modelos (não é ponto de comparação entre SVR/MLP/XGB).
     print(f"\n  MAPE por faixa:")
     print(f"  {'Faixa':<8} {'N':>5} {'MAE':>6} {'MAPE%':>7} {'±1':>7} {'Bias':>7}")
     print(f"  {'─' * 42}")
@@ -514,14 +488,10 @@ def salvar(modelo, gs, param_grid, candidatos_k, resultado, metricas,
             ),
         },
 
-        # ── Resultados ────────────────────────────────────────────────────────
         "resultados_treino": metricas["treino"],
         "resultados_teste": metricas["teste"],
         "gap_treino_teste": metricas["gap_treino_teste"],
 
-        # ── Por faixa ─────────────────────────────────────────────────────────
-        # Convenção: [1],[2],[3-4],[5-7],[8+] — alinhada com XGBoost e MLP
-        # A faixa [0] aparece apenas para diagnóstico interno.
         "resultados_por_faixa": metricas["por_faixa"],
         "nota_faixas": (
             "Faixas [1],[2],[3-4],[5-7],[8+] — convenção adotada nos três modelos. "
@@ -538,8 +508,6 @@ def salvar(modelo, gs, param_grid, candidatos_k, resultado, metricas,
             "por_grupo": grupo_counts,
         },
 
-        # ── Eficiência ────────────────────────────────────────────────────────
-        # NOVO: tempo de inferência por imagem (mediana de 5 passes, com warmup)
         "eficiencia": {
             "tempo_grid_search_s": tempo_gs,
             "tempo_treino_final_s": tempo_treino,
@@ -557,13 +525,6 @@ def salvar(modelo, gs, param_grid, candidatos_k, resultado, metricas,
 
     with open(os.path.join(OUTPUT_DIR, "svr_v11_relatorio.json"), "w", encoding="utf-8") as f:
         json.dump(saida, f, indent=2, ensure_ascii=False)
-
-    print(f"  Arquivos em: {OUTPUT_DIR}/")
-    print(f"    ├─ svr_v3_modelo.joblib")
-    print(f"    ├─ svr_v11_relatorio.json")
-    print(f"    ├─ svr_v3_predicoes_teste.csv")
-    print(f"    ├─ svr_v3_features_selecionadas.csv")
-    print(f"    └─ svr_v3_grid_search_resultados.csv")
 
     return saida
 

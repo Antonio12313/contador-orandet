@@ -1,27 +1,3 @@
-"""
-REFERÊNCIAS PRINCIPAIS:
-  Maldonado & Barbosa (2016) — Bas-relief + razão brilho vertical, citrus verde
-  Kurtulmus et al. (2011)   — Gabor isotropy, citrus sobre fundo verde
-  Zhao & Lee (2016)         — SATD, 83.4% acurácia citrus verde
-  Okamoto & Lee (2009)      — Chromaticidade Cr-Cb para citrus verde
-  Hu (2018)                 — LBP + MSER + Hough hierárquico para citrus verde
-  Frangi et al. (1998)      — Hessiana multiscale blob enhancement
-
-CORREÇÕES desta versão (v8.1):
-  [BUG] features_geometria: cv2.MSER_create(_delta=...) lançava TypeError no
-        OpenCV 4.x e o try/except zerava tudo (MSER sempre = 0). Corrigido
-        para usar setters — G10 e cnt_mser_* agora funcionam.
-  [BUG] features derivadas usavam f["mascara_prop_fruta"] / f["mascara_n_blobs"]
-        que nunca eram criadas → KeyError em toda imagem. Agora essas features
-        de máscara são calculadas (e populam o grupo G_mascara).
-  [LIMPEZA] Removidas augmentação comentada e helpers não usados (treino é só
-        nas 2759 originais).
-  [META] gerar_info: normalização corrigida para z-score (StandardScaler não
-        produz [0,1]); augmentação marcada como não aplicada.
-  [MELHORIA] máscara passada às features de cor (HSV/RGB/LAB); guarda anti
-        região-plana na isotropia de Gabor; V_eq reaproveitado na contagem.
-"""
-
 import os
 import json
 import warnings
@@ -77,7 +53,6 @@ _SUFIXOS_FO = ["mean", "std", "median", "entropy", "p10", "p90", "iqr",
 
 
 def _first_order(canal, prefixo):
-    """12 estatísticas de primeira ordem compactas."""
     c = np.array(canal, dtype=np.float64).flatten()
     if len(c) == 0:
         return {f"{prefixo}_{s}": 0.0 for s in _SUFIXOS_FO}
@@ -107,7 +82,6 @@ def _first_order(canal, prefixo):
 
 
 def _first_order_mascara(canal, mascara, prefixo):
-    """Aplica first_order apenas nos pixels dentro da máscara."""
     px = canal[mascara > 0]
     if len(px) == 0:
         return {f"{prefixo}_{s}": 0.0 for s in _SUFIXOS_FO}
@@ -115,8 +89,6 @@ def _first_order_mascara(canal, mascara, prefixo):
 
 
 def _stats_mascarado(canal, mascara, prefixo):
-    """Calcula _first_order só sobre os pixels da fruta.
-    Faz fallback para a imagem inteira se a máscara for vazia/minúscula."""
     if mascara is not None:
         vals = canal[mascara > 0]
         if vals.size < 50:
@@ -129,12 +101,6 @@ def _stats_mascarado(canal, mascara, prefixo):
 # MAPAS AUXILIARES
 
 def _gabor_isotropy_map(gray):
-    """Isotropia Gabor: fruta esférica = resposta uniforme em todas orientações.
-
-    Guarda anti região-plana: onde NÃO há resposta de Gabor (fundo liso sem
-    textura), a isotropia é zerada — evita marcar fundo plano como 'esférico',
-    que era um falso sinal das versões anteriores.
-    """
     orientacoes = [0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
     respostas = []
     for theta in orientacoes:
@@ -155,7 +121,6 @@ def _gabor_isotropy_map(gray):
 
 
 def _satd_map(gray):
-    """SATD: fruta lisa = baixo, nervura = alto."""
     gray_f = gray.astype(np.float32)
     blur5 = cv2.blur(gray_f, (5, 5))
     blur11 = cv2.blur(gray_f, (11, 11))
@@ -163,18 +128,12 @@ def _satd_map(gray):
 
 
 def _laplacian_smooth_map(gray):
-    """Laplaciano suavizado: folha = alto (nervuras), fruta = baixo."""
     lap = cv2.Laplacian(gray, cv2.CV_64F, ksize=3)
     lap_abs = np.abs(lap).astype(np.float32)
     return cv2.GaussianBlur(lap_abs, (31, 31), 0)
 
 
 def _hessian_convexity_map(gray):
-    """
-    Mapa de 'blob-ness' via Hessiana.
-    Esfera: det>0 e trace>0. Folha plana: det≈0. Nervura: det<0.
-    Ref: Frangi et al. (1998).
-    """
     gray_f = gray.astype(np.float64)
     gray_blur = cv2.GaussianBlur(gray_f, (5, 5), 1.5)
 
@@ -196,11 +155,6 @@ def _hessian_convexity_map(gray):
 # MÁSCARA v7.1
 
 def construir_mascara_fruta_verde(img_bgr):
-    """
-    Máscara v7.1: 6 critérios (votação 2/6).
-    A: Gabor Isotropy  |  B: SATD liso  |  C: Laplaciano baixo
-    D: LAB b*          |  E: Hessiana blob-ness  |  F: Cr-Cb diff
-    """
     h, w = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
@@ -1188,22 +1142,9 @@ def _extrair_de_img(img_bgr):
             f[f"spatial_{idx}_grad_std"] = float(grad.std())
             idx += 1
 
-    # Features de máscara (G_mascara) — [BUG CORRIGIDO] antes eram referenciadas
-    # sem nunca terem sido criadas, causando KeyError nas features derivadas.
-    # prop_fruta = float((mascara > 0).mean())
-    # cnts_m, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    # n_blobs_m = sum(1 for c in cnts_m if cv2.contourArea(c) >= 100)
-    # f["mascara_prop_fruta"] = prop_fruta
-    # f["mascara_n_blobs"] = float(n_blobs_m)
-
-    # Features derivadas
-    # f["density_blob_ratio"] = float(prop_fruta / max(n_blobs_m, 1e-6))
-    # f["hog_fft_ratio"] = float(f.get("hog_mean", 0.0) / (f.get("fft_mean", 0.0) + 1e-6))
-
     return f
 
 
-# Leitura de anotações COCO
 def carregar_anotacoes(ann_file, img_dir):
     with open(ann_file, "r") as f:
         coco = json.load(f)
@@ -1222,7 +1163,6 @@ def carregar_anotacoes(ann_file, img_dir):
     ]
 
 
-# Processamento de um split (sem augmentação — treino usa só as originais)
 def processar_split(registros, nome_split):
     linhas = []
     erros = 0
@@ -1240,7 +1180,7 @@ def processar_split(registros, nome_split):
 
             cnt = reg["contagem"]
             _t0 = time.perf_counter()
-            feats = _extrair_de_img(img)               # resize feito internamente
+            feats = _extrair_de_img(img)
             tempos_extracao.append(time.perf_counter() - _t0)
 
             linha = {
@@ -1289,7 +1229,6 @@ def processar_split(registros, nome_split):
     return pd.DataFrame(linhas), stats_tempo
 
 
-# Seleção automática de features
 def selecionar_features(df_train, df_test, var_thr=VAR_THRESHOLD, corr_thr=CORR_THRESHOLD):
     cols = [c for c in df_train.columns if c not in COLUNAS_META]
     removidas = []
@@ -1312,7 +1251,6 @@ def selecionar_features(df_train, df_test, var_thr=VAR_THRESHOLD, corr_thr=CORR_
     return df_train[colunas_finais], df_test[colunas_finais], removidas, cols
 
 
-# Normalização (z-score)
 def normalizar(df_train, df_test):
     cols = [c for c in df_train.columns if c not in COLUNAS_META]
 
@@ -1323,7 +1261,7 @@ def normalizar(df_train, df_test):
     df_train[cols] = df_train[cols].fillna(medianas)
     df_test[cols] = df_test[cols].fillna(medianas)
 
-    scaler = StandardScaler()                 # z-score; fit só no treino
+    scaler = StandardScaler()
     scaler.fit(df_train[cols])
 
     df_tn = df_train.copy()
@@ -1341,7 +1279,6 @@ def normalizar(df_train, df_test):
     return df_tn, df_tt, scaler
 
 
-# Metadados
 def gerar_info(df_train, df_test, removidas, n_features_final,
                stats_tempo_treino=None, stats_tempo_teste=None, ambiente=None):
     cols = [c for c in df_train.columns if c not in COLUNAS_META]

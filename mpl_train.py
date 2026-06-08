@@ -265,11 +265,6 @@ def treinar_e_avaliar(melhores_params, X_full, y_full_log, y_full_orig,
 # ── INFERÊNCIA — tempo por imagem ─────────────────────────────────────────────
 
 def medir_inferencia(modelo, X_test, n_repeticoes=50):
-    """
-    Mede tempo de inferência por imagem com n_repeticoes passagens completas
-    pelo conjunto de teste e reporta média e desvio por amostra.
-    Metodologia idêntica à do XGBoost para comparação direta.
-    """
     print(f"\n[4/5] Medindo tempo de inferência ({n_repeticoes} repetições)...")
 
     tempos = []
@@ -295,20 +290,10 @@ def medir_inferencia(modelo, X_test, n_repeticoes=50):
         "tempo_total_medio_ms": ms_total_mean,
         "tempo_por_imagem_ms": ms_por_img_mean,
         "tempo_por_imagem_std_ms": ms_por_img_std,
-        "nota": (
-            "Inferência em batch sobre o conjunto de teste completo. "
-            "Não inclui extração de features — apenas forward pass do MLP. "
-            "Comparável ao campo equivalente do XGBoost e SVR."
-        ),
     }
 
 
-# ── DIAGNÓSTICO POR FAIXA ─────────────────────────────────────────────────────
-
 def diagnostico_por_faixa(y_test, y_pred):
-    """
-    Faixas: [0], [1], [2], [3-4], [5-7], [8+] — consistentes com XGBoost e SVR.
-    """
     print("\n  MAPE por faixa de contagem:")
     print(f"  {'Faixa':<8} {'N':>5} {'MAE':>6} {'MAPE%':>7} {'±1':>7} {'Bias':>7}")
     print(f"  {'─' * 42}")
@@ -341,8 +326,6 @@ def diagnostico_por_faixa(y_test, y_pred):
 
     return metricas_f
 
-
-# ── RELATÓRIO POR IMAGEM ──────────────────────────────────────────────────────
 
 def gerar_relatorio_imagens(y_test, y_pred, y_pred_int, nomes_test, ids_test):
     n = len(y_test)
@@ -389,10 +372,7 @@ def imprimir_tabela_tcc(res_grid, n=10):
               f"{row['mape_cv']:>8.2f}%  ±{row['mape_cv_std']:.2f}%")
 
 
-# ── CAPTURA DE AMBIENTE ───────────────────────────────────────────────────────
-
 def capturar_ambiente():
-    """Captura CPU, RAM e versões — necessário para relatar eficiência com honestidade."""
     info = {
         "sistema": platform.system(),
         "maquina": platform.machine(),
@@ -410,8 +390,6 @@ def capturar_ambiente():
     return info
 
 
-# ── SALVAR — JSON completo para reprodutibilidade IEEE ────────────────────────
-
 def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
            metricas, metricas_faixa, inferencia, res_grid, df_pred, feat_cols,
            n_treino_full, n_treino_orig, n_teste,
@@ -420,11 +398,10 @@ def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    joblib.dump(modelo, f"{OUTPUT_DIR}/mlp_v9_modelo.joblib")
-    res_grid.to_csv(f"{OUTPUT_DIR}/mlp_v9_grid_todas_arquiteturas.csv", index=False)
-    df_pred.to_csv(f"{OUTPUT_DIR}/mlp_v9_predicoes_por_imagem.csv", index=False)
+    joblib.dump(modelo, f"{OUTPUT_DIR}/mlp_modelo.joblib")
+    res_grid.to_csv(f"{OUTPUT_DIR}/mlp_grid_todas_arquiteturas.csv", index=False)
+    df_pred.to_csv(f"{OUTPUT_DIR}/mlp_predicoes_por_imagem.csv", index=False)
 
-    # ── Versões ───────────────────────────────────────────────────────────────
     try:
         versao_sklearn = importlib.metadata.version("scikit-learn")
     except Exception:
@@ -436,7 +413,6 @@ def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
         import scipy;
         versao_scipy = scipy.__version__
 
-    # ── CV por fold do melhor candidato ───────────────────────────────────────
     cv_por_fold = []
     if not res_grid.empty:
         best_row = res_grid.iloc[0]
@@ -448,7 +424,6 @@ def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
                     "mape_cv": round(float(-best_row[chave]), 4),
                 })
 
-    # ── Serializar melhores_params ────────────────────────────────────────────
     melhores_params_serial = {}
     for k, v in melhores_params.items():
         if isinstance(v, tuple):
@@ -458,10 +433,8 @@ def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
         else:
             melhores_params_serial[k] = v
 
-    # ── JSON ──────────────────────────────────────────────────────────────────
     saida = {
 
-        # ── Protocolo ─────────────────────────────────────────────────────────
         "protocolo": {
             "dataset_treino": "orandet_v11_train_norm.csv (normalizado)",
             "dataset_teste": "orandet_v11_test_norm.csv  (normalizado)",
@@ -481,8 +454,6 @@ def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
             ),
         },
 
-
-        # ── Arquitetura ───────────────────────────────────────────────────────
         "arquitetura": {
             "tipo": "MLPRegressor (scikit-learn)",
             "hidden_layer_sizes": str(melhores_params["hidden_layer_sizes"]),
@@ -490,7 +461,6 @@ def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
             "solver": melhores_params["solver"],
         },
 
-        # ── Hiperparâmetros finais ────────────────────────────────────────────
         "hiperparametros_finais": {
             **melhores_params_serial,
             "max_iter_treino_final": 2000,
@@ -502,10 +472,8 @@ def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
             "validation_fraction_cv": 0.1,
         },
 
-        # ── Espaço de busca ───────────────────────────────────────────────────
         "espaco_de_busca": PARAM_DIST_DOC,
 
-        # ── Busca de hiperparâmetros ──────────────────────────────────────────
         "busca_hiperparametros": {
             "metodo": "HalvingRandomSearchCV",
             "n_candidatos_inicial": 60,
@@ -526,13 +494,11 @@ def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
             "por_fold": cv_por_fold,
         },
 
-        # ── Resultados ────────────────────────────────────────────────────────
         "resultados_treino": metricas["treino"],
         "resultados_teste": metricas["teste"],
         "gap_treino_teste": metricas["gap_treino_teste"],
         "resultados_por_faixa": metricas_faixa,
 
-        # ── Eficiência ────────────────────────────────────────────────────────
         "eficiencia": {
             "tempo_grid_search_s": tempo_gs,
             "tempo_treino_final_s": tempo_treino,
@@ -541,22 +507,13 @@ def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
             "versao_scipy": versao_scipy,
         },
 
-        # ── Ambiente de execução ──────────────────────────────────────────────
-        "ambiente": ambiente,  # ← novo: CPU/RAM/OS
+        "ambiente": ambiente,  #
 
-        # ── Timestamp ─────────────────────────────────────────────────────────
         "timestamp": ts,
     }
 
-    with open(f"{OUTPUT_DIR}/mlp_v9_relatorio.json", "w", encoding="utf-8") as f:
+    with open(f"{OUTPUT_DIR}/mlp_relatorio.json", "w", encoding="utf-8") as f:
         json.dump(saida, f, indent=2, ensure_ascii=False)
-
-    print(f"  Arquivos em: {OUTPUT_DIR}/")
-    print(f"    ├─ mlp_v9_modelo.joblib")
-    print(f"    ├─ mlp_v9_relatorio.json          ← protocolo + grade + métricas completas")
-    print(f"    ├─ mlp_v9_grid_todas_arquiteturas.csv")
-    print(f"    └─ mlp_v9_predicoes_por_imagem.csv")
-
     return saida
 
 
@@ -564,7 +521,7 @@ def salvar(modelo, melhores_params, melhor_mape_cv, mape_cv_std,
 
 def main():
     print("\n" + "═" * 65)
-    print("  MLP v9 — Contagem de Laranjas Verdes (OranDet v11)")
+    print("  MLP — Contagem de Laranjas Verdes (OranDet)")
     print("  Target: log1p(y)  |  Inversa: expm1")
     print("  Busca: HalvingRandomSearchCV (60 candidatos, fator 3)")
     print("═" * 65)
