@@ -443,36 +443,17 @@ def gerar_figura_basrelief(reg):
     # Chamada real do mapa bas-relief do seu código
     bas = extrator._bas_relief_map(V_eq)
 
-    contorno = desenhar_contornos(img_416, mascara)
+    out_rgb = OUT_DIR / "fig_basrelief_01_rgb_416.png"
+    out_v_eq = OUT_DIR / "fig_basrelief_02_v_equalizado.png"
+    out_bas = OUT_DIR / "fig_basrelief_03_basrelief.png"
 
-    fig, axes = plt.subplots(1, 4, figsize=(15, 4.2))
+    cv2.imwrite(str(out_rgb), img_416)
+    cv2.imwrite(str(out_v_eq), V_eq)
+    cv2.imwrite(str(out_bas), bas)
 
-    axes[0].imshow(bgr_to_rgb(img_416))
-    axes[0].set_title("Imagem RGB 416×416")
-    axes[0].axis("off")
-
-    axes[1].imshow(V_eq, cmap="gray", vmin=0, vmax=255)
-    axes[1].set_title("Canal V equalizado")
-    axes[1].axis("off")
-
-    axes[2].imshow(bas, cmap="gray", vmin=0, vmax=255)
-    axes[2].set_title("Bas-relief do código")
-    axes[2].axis("off")
-
-    axes[3].imshow(bgr_to_rgb(contorno))
-    axes[3].set_title("Máscara usada no G4")
-    axes[3].axis("off")
-
-    fig.suptitle(
-        f"{Path(reg['file_name']).name} | contagem COCO = {reg['contagem']}"
-    )
-    fig.tight_layout()
-
-    out = OUT_DIR / "fig_basrelief.png"
-    fig.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-    print(f"[OK] Fig. 5 salva: {out}")
+    print(f"[OK] Imagem RGB salva: {out_rgb}")
+    print(f"[OK] Canal V equalizado salvo: {out_v_eq}")
+    print(f"[OK] Bas-relief salvo: {out_bas}")
 
 
 # ============================================================
